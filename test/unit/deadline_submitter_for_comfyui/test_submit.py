@@ -23,6 +23,7 @@ from deadline.comfyui_submitter.submit import (
     create_job_bundle,
     custom_nodes,
     expand_dynamic_prompt,
+    get_safe_path,
     local_node_packs,
     model_downloads,
     models_with_mismatched_links,
@@ -652,6 +653,35 @@ def test_bundled_template_custom_nodes():
 )
 def test_safe_name(name, expected):
     assert safe_name(name) == expected
+
+
+def test_get_safe_path_keeps_paths_inside_the_base(tmp_path):
+    target = get_safe_path("20261019T123005123456Z_my_workflow", tmp_path)
+    assert target == Path(os.path.realpath(tmp_path)) / "20261019T123005123456Z_my_workflow"
+
+
+@pytest.mark.parametrize("user_input", ["../escape", "sub/../../escape", "/etc/passwd"])
+def test_get_safe_path_rejects_escapes(tmp_path, user_input):
+    with pytest.raises(ValueError, match="Path injection"):
+        get_safe_path(user_input, tmp_path)
+
+
+def test_get_safe_path_rejects_a_sibling_prefixed_like_the_base(tmp_path):
+    base = tmp_path / "base"
+    base.mkdir()
+    (tmp_path / "base_evil").mkdir()
+    with pytest.raises(ValueError, match="Path injection"):
+        get_safe_path("../base_evil", base)
+
+
+def test_get_safe_path_rejects_a_symlink_that_escapes(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "link").symlink_to(outside)
+    with pytest.raises(ValueError, match="Path injection"):
+        get_safe_path("link", base)
 
 
 def test_create_job_bundle(tmp_path):

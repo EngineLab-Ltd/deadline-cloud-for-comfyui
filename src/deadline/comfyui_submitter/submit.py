@@ -1216,6 +1216,20 @@ def safe_name(name: str) -> str:
     return stem[:100] or "workflow"
 
 
+def get_safe_path(user_input: str, base_dir: Path | str) -> Path:
+    """
+    user_input resolved against base_dir. Raises ValueError when the resolved path would fall
+    outside base_dir, for example through ".." segments or a symlink. realpath resolves both
+    ".." and symlinks, and the boundary check compares against base_dir plus a path separator
+    so a sibling such as "base_dir_evil" doesn't pass for a child of base_dir.
+    """
+    base = os.path.realpath(base_dir)
+    target = os.path.realpath(os.path.join(base, user_input))
+    if target != base and not target.startswith(base + os.sep):
+        raise ValueError("Access Denied: Path injection attempt detected.")
+    return Path(target)
+
+
 def job_template_with_items(template: Path, sources: list[ItemSource] | None) -> dict[str, Any]:
     """Reads a job template, with a parameter for each of the workflow's sources of work items."""
     import yaml
@@ -1370,7 +1384,13 @@ def create_job_bundle(
             else _dump_template(job_template)
         )
     now = now or datetime.now(timezone.utc)
-    bundle_dir = dest_dir / f"{now.strftime('%Y%m%dT%H%M%S%fZ')}_{safe_name(name)}"
+    leaf = f"{now.strftime('%Y%m%dT%H%M%S%fZ')}_{safe_name(name)}"
+    # The name comes from the request. safe_name strips traversal, and get_safe_path is the
+    # belt-and-suspenders check that the bundle still lands inside dest_dir.
+    try:
+        bundle_dir = get_safe_path(leaf, dest_dir)
+    except ValueError as e:
+        raise SubmitError(str(e)) from e
     bundle_dir.mkdir(parents=True)
     if text is None:
         shutil.copyfile(template, bundle_dir / f"template{suffix}")

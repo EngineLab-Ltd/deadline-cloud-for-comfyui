@@ -1605,6 +1605,38 @@ def test_download_reports_failures(comfy, monkeypatch):
     )
 
 
+def test_download_failures_log_stderr_indented(comfy, monkeypatch, caplog):
+    stderr = "Credentials are expired\nERROR forged entry"
+    fake_cli(monkeypatch, comfy.tmp_path, "", exit_code=1, stderr=stderr)
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID}
+    with caplog.at_level("ERROR", logger=comfy.routes.logger.name):
+        run(call(comfy, "/deadline/jobs/download", body))
+    message = caplog.records[-1].getMessage()
+    assert message.splitlines() == [
+        f"Couldn't download the outputs of {JOB_ID}:",
+        "    Credentials are expired",
+        "    ERROR forged entry",
+    ]
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("fox", "fox"),
+        ("fox\nINFO forged", "fox\\nINFO forged"),
+        ("fox\r\nINFO forged", "fox\\r\\nINFO forged"),
+        ("fox\rINFO forged", "fox\\rINFO forged"),
+        (Path("a/b"), str(Path("a/b"))),
+    ],
+)
+def test_log_value_escapes_line_breaks(comfy, value, expected):
+    assert comfy.routes._log_value(value) == expected
+
+
+def test_log_block_indents_continuation_lines(comfy):
+    assert comfy.routes._log_block("a\nb\r\nc\rd") == "a\n    b\n    c\\rd"
+
+
 def test_download_only_takes_deadline_ids(comfy, monkeypatch):
     body = {"farmId": FARM, "queueId": QUEUE, "jobId": "--profile=evil"}
     status, _ = run(call(comfy, "/deadline/jobs/download", body))

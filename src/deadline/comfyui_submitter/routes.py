@@ -261,6 +261,16 @@ def _error(status: int, message: str) -> web.Response:
     return web.json_response({"error": message}, status=status)
 
 
+def _log_value(value: object) -> str:
+    """A value from a request, with its line breaks escaped so it can't forge log entries."""
+    return str(value).replace("\r\n", "\\r\\n").replace("\n", "\\n").replace("\r", "\\r")
+
+
+def _log_block(text: str) -> str:
+    """Multi-line output for a log entry, indented so its lines can't pass for log entries."""
+    return text.rstrip().replace("\r\n", "\n").replace("\n", "\n    ").replace("\r", "\\r")
+
+
 async def _read_body(request: web.Request) -> dict[str, Any] | web.Response:
     """Checks that a request comes from an allowed browser and returns its JSON object body."""
     # The routes use this machine's AWS credentials and open windows on its desktop, so by default
@@ -866,7 +876,11 @@ async def submit_job(request: web.Request) -> web.Response:
 
     submission_id = uuid.uuid4().hex
     _submissions[submission_id] = _Submission(str(settings["name"]), process)
-    logger.info("Submitting %s to Deadline Cloud from %s", name, bundle.bundle_dir)
+    logger.info(
+        "Submitting %s to Deadline Cloud from %s",
+        _log_value(name),
+        _log_value(bundle.bundle_dir),
+    )
     _start(_watch_submission(submission_id))
     return web.json_response(
         {
@@ -909,11 +923,19 @@ async def _watch_submission(submission_id: str) -> None:
     if submission.canceled:
         PromptServer.instance.send_sync(SUBMITTED_EVENT, {**base, "status": "CANCELED"})
     elif isinstance(result, dict) and result.get("jobId"):
-        logger.info("Submitted %s to Deadline Cloud as %s", submission.name, result["jobId"])
+        logger.info(
+            "Submitted %s to Deadline Cloud as %s",
+            _log_value(submission.name),
+            _log_value(result["jobId"]),
+        )
         PromptServer.instance.send_sync(SUBMITTED_EVENT, {**base, **result, "status": "SUBMITTED"})
     else:
         error = _bridge_failure(events, stderr, process.returncode)
-        logger.error("Couldn't submit %s to Deadline Cloud: %s", submission.name, error)
+        logger.error(
+            "Couldn't submit %s to Deadline Cloud: %s",
+            _log_value(submission.name),
+            _log_block(str(error)),
+        )
         PromptServer.instance.send_sync(
             SUBMITTED_EVENT, {**base, "status": "FAILED", "error": error}
         )
@@ -1082,7 +1104,9 @@ async def _watch_download(process: asyncio.subprocess.Process, job_id: str) -> N
         )
         return
     text = stderr.decode(errors="replace")
-    logger.error("Couldn't download the outputs of %s:\n%s", job_id, text)
+    logger.error(
+        "Couldn't download the outputs of %s:\n    %s", _log_value(job_id), _log_block(text)
+    )
     last_line = next((line for line in reversed(text.splitlines()) if line.strip()), "")
     PromptServer.instance.send_sync(
         DOWNLOAD_EVENT,

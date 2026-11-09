@@ -715,7 +715,7 @@ def plan_work_items(
                     break
         if dynamic:
             # Each dynamic prompt maps to its task parameter, or "" to choose at random.
-            meta[DYNAMIC_PROMPTS_META] = {key: "" for key in dynamic}
+            meta[DYNAMIC_PROMPTS_META] = dict.fromkeys(dynamic, "")
             several = len(dynamic) > 1
             for key, prompts in dynamic.items():
                 if len(prompts) > MAX_LIST_ITEMS:
@@ -1219,13 +1219,14 @@ def safe_name(name: str) -> str:
 def get_safe_path(user_input: str, base_dir: Path | str) -> Path:
     """
     user_input resolved against base_dir. Raises ValueError when the resolved path would fall
-    outside base_dir, for example through ".." segments or a symlink. realpath resolves both
-    ".." and symlinks, and the boundary check compares against base_dir plus a path separator
-    so a sibling such as "base_dir_evil" doesn't pass for a child of base_dir.
+    outside base_dir, for example through ".." segments or a symlink, or when it is base_dir
+    itself. realpath resolves both ".." and symlinks, and the boundary check compares against
+    base_dir plus a path separator so a sibling such as "base_dir_evil" doesn't pass for a
+    child of base_dir.
     """
     base = os.path.realpath(base_dir)
     target = os.path.realpath(os.path.join(base, user_input))
-    if target != base and not target.startswith(base + os.sep):
+    if not target.startswith(base + os.sep):
         raise ValueError("Access Denied: Path injection attempt detected.")
     return Path(target)
 
@@ -1384,9 +1385,10 @@ def create_job_bundle(
             else _dump_template(job_template)
         )
     now = now or datetime.now(timezone.utc)
-    leaf = f"{now.strftime('%Y%m%dT%H%M%S%fZ')}_{safe_name(name)}"
+    stem = safe_name(name)
+    leaf = f"{now.strftime('%Y%m%dT%H%M%S%fZ')}_{stem}"
     # The name comes from the request. safe_name strips traversal, and get_safe_path is the
-    # belt-and-suspenders check that the bundle still lands inside dest_dir.
+    # belt-and-suspenders check that the bundle and workflow file still land inside dest_dir.
     try:
         bundle_dir = get_safe_path(leaf, dest_dir)
     except ValueError as e:
@@ -1396,6 +1398,9 @@ def create_job_bundle(
         shutil.copyfile(template, bundle_dir / f"template{suffix}")
     else:
         (bundle_dir / f"template{suffix}").write_text(text, encoding="utf-8")
-    workflow_path = bundle_dir / f"{safe_name(name)}_api.json"
+    try:
+        workflow_path = get_safe_path(f"{stem}_api.json", bundle_dir)
+    except ValueError as e:
+        raise SubmitError(str(e)) from e
     workflow_path.write_text(json.dumps(workflow, indent=2), encoding="utf-8")
     return bundle_dir, workflow_path

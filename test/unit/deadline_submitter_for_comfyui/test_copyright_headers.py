@@ -47,7 +47,7 @@ def test_copyright_headers():
     while not (root_project_dir / "test").exists():
         root_project_dir = root_project_dir.parent
     # Call out every directory & extension we expect to see copyright headers in; non-exhaustive but best-effort
-    top_level_dirs = ["src", "test", "scripts"]
+    top_level_dirs = ["src", "test", "scripts", "frontend"]
     file_count = 0
     failed_files = set()
     for top_level_dir in top_level_dirs:
@@ -56,10 +56,15 @@ def test_copyright_headers():
             "**/*.sh",
             "**/Dockerfile",
             "**/*.ts",
+            "**/*.js",
+            "**/*.mjs",
             "**/*.ps1",
             "**/*.xml",
         ):
             for path in Path(root_project_dir / top_level_dir).glob(glob_pattern):
+                # npm's packages, such as TypeScript, aren't this project's code.
+                if "node_modules" in path.parts:
+                    continue
                 print(path)
                 if not _is_version_file(path):
                     try:

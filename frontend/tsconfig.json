@@ -1,0 +1,19 @@
+{
+  // The panel's TypeScript source. `npm run build` compiles it into the extension's web folder,
+  // which ComfyUI serves as is. install_submitter.py runs the build, and the compiled files
+  // aren't committed.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "strict": true,
+    "noEmitOnError": true,
+    "newLine": "lf",
+    // src/extensions/deadline-cloud mirrors where ComfyUI serves the extension, so imports such as
+    // ../../scripts/app.js find the type declarations in src/scripts, and compile unchanged.
+    "rootDir": "src/extensions/deadline-cloud",
+    "outDir": "../src/deadline/comfyui_submitter/web"
+  },
+  "include": ["src"]
+}

@@ -17,3 +17,13 @@ __pycache__/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+
+# The frontend's build tools, from npm ci in frontend/
+node_modules/
+
+# The panel's JavaScript, compiled from frontend/ by npm run build. install_submitter.py builds it.
+/src/deadline/comfyui_submitter/web/*.js
+
+# Created by install_submitter.py when the extension runs from this checkout
+.deadline-cli/
+deadline_cloud_submitter.json

@@ -192,6 +192,8 @@ the same machine.
 
 - The routes only accept a browser on the ComfyUI machine. A request from another address, or one
   with a `Forwarded`, `X-Forwarded-For` or `X-Real-IP` header from a reverse proxy, gets a 403.
+- They only accept requests addressed to `localhost` or a loopback address such as `127.0.0.1`,
+  so a website that points its own domain name at this machine can't pass for ComfyUI's page.
 - They refuse requests that a browser marks as coming from another website, even when
   `--enable-cors-header` turns off ComfyUI's own check.
 - They only accept JSON, which a page from another website can't send without the server's

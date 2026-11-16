@@ -58,6 +58,9 @@ if (scenario === "edited-before-replanning") {
   await settle();
   result.jobsAfterEdit = jobs();
   result.replanned = api.calls.filter(({ path }) => path === "/deadline/plan").length === 2;
+  result.planClientIds = api.calls
+    .filter(({ path }) => path === "/deadline/plan")
+    .map(({ body }) => body.clientId);
   await ui.submit();
   result.jobs = jobs();
 } else if (scenario === "edited-while-planning") {

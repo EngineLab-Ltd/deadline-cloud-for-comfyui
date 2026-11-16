@@ -305,14 +305,13 @@ def test_create_job_bundle_description_is_valid_at_the_limit(tmp_path):
     )
     template = yaml.safe_load((bundle_dir / "template.yaml").read_text())
     assert template["description"] == description
-    decode_job_template(template=template, supported_extensions=["EXPR"])
+    decode_job_template(template=template)
 
 
 def _tasks(bundle_dir: Path, tmp_path: Path, **values: str) -> list[dict[str, str]]:
     """Creates the bundle's job with openjd-model, as Deadline Cloud does, and lists its tasks."""
     template = decode_job_template(
         template=yaml.safe_load((bundle_dir / "template.yaml").read_text()),
-        supported_extensions=["EXPR"],
     )
     parameters = preprocess_job_parameters(
         job_template=template,

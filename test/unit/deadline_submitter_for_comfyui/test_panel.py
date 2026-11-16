@@ -78,6 +78,8 @@ def test_submitting_an_edit_before_replanning_waits_for_the_new_plan(run_scenari
     result = run_scenario("edited-before-replanning")
     assert result["jobsAfterEdit"] == []
     assert result["replanned"]
+    # Only a newer plan from the same tab replaces a waiting one.
+    assert result["planClientIds"] == ["tab-1", "tab-1"]
     [job] = result["jobs"]
     assert {key: job[key] for key in NEW} == NEW
     # The server sends the submission's events to this tab only.

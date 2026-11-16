@@ -229,6 +229,16 @@ def test_jobs_allows_remote_clients_when_configured(comfy, monkeypatch):
         ("127.0.0.1", {"Sec-Fetch-Site": "same-site"}, True, 403),
         # Typed into the address bar or sent by a tool, not by another page.
         ("127.0.0.1", {"Sec-Fetch-Site": "none"}, False, 200),
+        ("127.0.0.1", {"Host": "localhost:8188"}, False, 200),
+        ("::1", {"Host": "[::1]:8188"}, False, 200),
+        # A website that points its own name at 127.0.0.1 (DNS rebinding) is same-origin.
+        (
+            "127.0.0.1",
+            {"Host": "attacker.example:8188", "Sec-Fetch-Site": "same-origin"},
+            False,
+            403,
+        ),
+        ("127.0.0.1", {"Host": "attacker.example:8188"}, True, 200),
     ],
 )
 @pytest.mark.parametrize("path", ["/deadline/plan", "/deadline/jobs/cancel"])
@@ -833,6 +843,43 @@ def test_plans_run_one_at_a_time_off_the_event_loop(comfy, monkeypatch):
     assert answered_in < 0.4
     # The second plan waited behind the first, and the third replaced it.
     assert statuses == [200, 409, 200]
+    assert comfy.routes._plan_requests == {}
+
+
+def test_plan_from_another_tab_doesnt_replace_a_waiting_one(comfy, monkeypatch):
+    import threading
+    import time
+
+    started = threading.Event()
+    plan = comfy.routes._plan
+
+    def slow_plan(*args):
+        started.set()
+        time.sleep(0.3)
+        return plan(*args)
+
+    monkeypatch.setattr(comfy.routes, "_plan", slow_plan)
+
+    async def plan_from_two_tabs():
+        app = web.Application()
+        app.add_routes(comfy.server.routes)
+        async with TestClient(TestServer(app)) as client:
+
+            async def post_plan(client_id):
+                body = {"workflow": WORKFLOW, "clientId": client_id}
+                response = await client.post("/deadline/plan", json=body)
+                return response.status
+
+            first = asyncio.ensure_future(post_plan("tab-a"))
+            await asyncio.to_thread(started.wait, 5)
+            second = asyncio.ensure_future(post_plan("tab-b"))
+            await asyncio.sleep(0.05)
+            third = asyncio.ensure_future(post_plan("tab-c"))
+            return await asyncio.gather(first, second, third)
+
+    # Each tab's plan waits its turn; none replaces another tab's.
+    assert run(plan_from_two_tabs()) == [200, 200, 200]
+    assert comfy.routes._plan_requests == {}
 
 
 def test_jobs_report_a_job_that_was_created_before_cancel_reached_it(comfy, monkeypatch):

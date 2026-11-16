@@ -3,7 +3,6 @@ name: ComfyUI Workflow (comfy-cli)
 description: >
   Runs a ComfyUI workflow headlessly with comfy-cli. A job environment starts ComfyUI once
   per session with comfy launch, and the task runs the workflow with comfy run.
-extensions: ["EXPR"]
 
 parameterDefinitions:
 

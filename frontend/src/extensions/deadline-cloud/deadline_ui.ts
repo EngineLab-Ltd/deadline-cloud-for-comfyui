@@ -404,7 +404,8 @@ export async function loadPlan(force = false) {
   let plan: Plan | null = null;
   let planError: string | null = null;
   try {
-    plan = await postJson<Plan>("/deadline/plan", body);
+    // A newer plan from this tab replaces this one, but one from another tab doesn't.
+    plan = await postJson<Plan>("/deadline/plan", { ...body, clientId: api.clientId });
   } catch (error) {
     if (error instanceof RouteError && error.status === 409) {
       // The server dropped it for a newer plan.

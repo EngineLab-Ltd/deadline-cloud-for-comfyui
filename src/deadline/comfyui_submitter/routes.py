@@ -128,6 +128,14 @@ def _is_loopback(remote: str | None) -> bool:
         return False
 
 
+def _is_local_host(host: str | None) -> bool:
+    """Whether a Host header names this machine by localhost or a loopback address."""
+    if host is None:
+        return False
+    host = host.strip("[]").rstrip(".").lower()
+    return host == "localhost" or host.endswith(".localhost") or _is_loopback(host)
+
+
 _CLIENT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 
@@ -178,6 +186,14 @@ async def _read_body(request: web.Request) -> dict[str, Any] | web.Response:
             "Deadline Cloud submits from the ComfyUI server, with its credentials, so it only "
             "accepts requests from a browser on that machine, not through a proxy. Set "
             f"{ALLOW_REMOTE_ENV_VAR}=1 to allow others.",
+        )
+    # A website can point its own name at 127.0.0.1, so that its page counts as same-origin with
+    # ComfyUI. Its name is still in the Host header.
+    if not _is_local_host(request.url.host) and not remote_allowed():
+        return _error(
+            403,
+            "Deadline Cloud only accepts requests to localhost or a loopback address. Set "
+            f"{ALLOW_REMOTE_ENV_VAR}=1 to allow other host names.",
         )
     if request.content_type != "application/json":
         return _error(415, "Expected a JSON request.")
@@ -273,30 +289,34 @@ def _plan(body: dict[str, Any], workflow: dict[str, Any], template: Path) -> dic
     }
 
 
-# One plan runs at a time, and one replaced while it waits doesn't run, so slow storage can't pile
-# up work.
+# One plan runs at a time, and one replaced by a newer plan from the same tab while it waits
+# doesn't run, so slow storage can't pile up work.
 _plan_lock = asyncio.Lock()
-_plan_requests = 0
+# The latest plan request of each tab, by client ID.
+_plan_requests: dict[str | None, int] = {}
 
 
 @PromptServer.instance.routes.post("/deadline/plan")
 async def plan_submission(request: web.Request) -> web.Response:
     """Returns what the panel shows for the workflow."""
-    global _plan_requests
     checked = await _read_request(request)
     if isinstance(checked, web.Response):
         return checked
     body, workflow, template = checked
-    _plan_requests += 1
-    this_request = _plan_requests
+    client_id = _client_id(body)
+    this_request = _plan_requests.get(client_id, 0) + 1
+    _plan_requests[client_id] = this_request
     async with _plan_lock:
-        if this_request != _plan_requests:
+        if _plan_requests.get(client_id) != this_request:
             return _error(409, "A newer plan replaced this one.")
         try:
             # Checking files can be slow on network storage, which mustn't hold up ComfyUI's server.
             plan = await asyncio.to_thread(_plan, body, workflow, template)
         except SubmitError as e:
             return _error(400, str(e))
+        finally:
+            if _plan_requests.get(client_id) == this_request:
+                del _plan_requests[client_id]
     return web.json_response(plan)
 
 

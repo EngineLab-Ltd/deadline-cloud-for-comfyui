@@ -1385,3 +1385,208 @@ def test_jobs_dont_read_a_model_id_as_another_models_name(comfy, monkeypatch):
     assert [path.relative_to(staged).as_posix() for path in staged.rglob("*.safetensors")] == [
         "loras/checkpoints/x.safetensors"
     ]
+
+
+REQUIREMENTS = {
+    "attributes": [{"name": "attr.worker.os.family", "anyOf": ["linux", "windows"]}],
+    "amounts": [{"name": "amount.worker.memory", "min": 8192}],
+}
+
+
+def _template_steps(bundle_dir: Path) -> list[dict]:
+    return yaml.safe_load((bundle_dir / "template.yaml").read_text())["steps"]
+
+
+def test_plan_starts_host_requirements_from_the_job_template(comfy, monkeypatch):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    status, body = run(call(comfy, "/deadline/plan", {"workflow": WORKFLOW, "name": "fox"}))
+    assert status == 200
+    assert body["hostRequirements"] == {
+        "attributes": [{"name": "attr.worker.os.family", "anyOf": ["linux"]}],
+        "amounts": [{"name": "amount.worker.gpu", "min": 1}],
+    }
+
+
+def test_jobs_replaces_the_host_requirements_and_description(comfy, monkeypatch):
+    fake_tools(monkeypatch, comfy.tmp_path)
+    body = {**JOB, "hostRequirements": REQUIREMENTS, "description": "Fox lookdev"}
+    status, response = run(call(comfy, "/deadline/jobs", body))
+    assert status == 202
+    template = yaml.safe_load((Path(response["job_bundle"]) / "template.yaml").read_text())
+    assert template["description"] == "Fox lookdev"
+    assert [step["hostRequirements"] for step in template["steps"]] == [REQUIREMENTS]
+
+
+def test_jobs_runs_on_any_worker_when_the_requirements_are_cleared(comfy, monkeypatch):
+    fake_tools(monkeypatch, comfy.tmp_path)
+    body = {**JOB, "hostRequirements": {"attributes": [], "amounts": []}}
+    status, response = run(call(comfy, "/deadline/jobs", body))
+    assert status == 202
+    assert "hostRequirements" not in _template_steps(Path(response["job_bundle"]))[0]
+
+
+def test_jobs_rejects_bad_host_requirements_before_submitting(comfy, monkeypatch):
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    bad = {"amounts": [{"name": "amount.worker.gpu", "min": 4, "max": 1}]}
+    status, response = run(call(comfy, "/deadline/jobs", {**JOB, "hostRequirements": bad}))
+    assert status == 400
+    assert "more than its max" in response["error"]
+    assert not requests.exists()
+    assert not (comfy.tmp_path / "user" / "deadline_submissions").exists()
+
+
+def test_bundle_saves_the_values_without_submitting(comfy, monkeypatch):
+    requests = fake_bridge(monkeypatch, comfy.tmp_path, {})
+    body = {
+        "workflow": WORKFLOW,
+        "name": "fox",
+        "parameters": {"ComfyUIArgs": ""},
+        "settings": {
+            "name": "Fox",
+            "priority": 80,
+            "targetTaskRunStatus": "SUSPENDED",
+            "maxRetriesPerTask": 2,
+            "maxWorkerCount": "",
+        },
+        "hostRequirements": REQUIREMENTS,
+    }
+    status, response = run(call(comfy, "/deadline/bundle", body))
+    assert status == 200
+    assert not requests.exists()
+    bundle = Path(response["job_bundle"])
+    saved = yaml.safe_load((bundle / "parameter_values.yaml").read_text())["parameterValues"]
+    values = {item["name"]: item["value"] for item in saved}
+    assert values["WorkflowFile"] == str(bundle / "fox_api.json")
+    assert values["ComfyUIArgs"] == ""
+    # deadline bundle submit reads the job settings from deadline:<name> values. An empty setting
+    # leaves the queue's default.
+    assert {name: value for name, value in values.items() if name.startswith("deadline:")} == {
+        "deadline:priority": 80,
+        "deadline:targetTaskRunStatus": "SUSPENDED",
+        "deadline:maxRetriesPerTask": 2,
+    }
+    assert (bundle / "parameter_values.yaml").stat().st_mode & 0o777 == 0o600 or os.name == "nt"
+    assert _template_steps(bundle)[0]["hostRequirements"] == REQUIREMENTS
+    # A saved bundle is submitted later, so it isn't deleted with the submissions.
+    assert not (bundle / comfy.routes.SUBMISSION_MARKER).exists()
+
+
+def test_bundle_rejects_bad_host_requirements(comfy, monkeypatch):
+    status, response = run(
+        call(comfy, "/deadline/bundle", {"workflow": WORKFLOW, "hostRequirements": "linux"})
+    )
+    assert status == 400
+    assert "hostRequirements" in response["error"]
+
+
+def test_download_sends_events_only_to_the_tab_that_asked(comfy, monkeypatch):
+    lines = [
+        {"messageType": "progress", "value": "50"},
+        {"messageType": "summary", "value": "Downloaded 2 files", "fileCount": 2},
+    ]
+    fake_cli(monkeypatch, comfy.tmp_path, "\n".join(map(json.dumps, lines)))
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
+    status, _ = run(call(comfy, "/deadline/jobs/download", body))
+    assert status == 202
+    assert comfy.server.sids == ["tab-1", "tab-1"]
+
+
+def test_download_runs_the_cli_and_reports_progress(comfy, monkeypatch):
+    lines = [
+        {"messageType": "title", "value": "fox"},
+        {"messageType": "progress", "value": "50"},
+        {"messageType": "summary", "value": "Downloaded 2 files", "fileCount": 2},
+    ]
+    args_file = fake_cli(monkeypatch, comfy.tmp_path, "\n".join(map(json.dumps, lines)))
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID}
+    status, result = run(call(comfy, "/deadline/jobs/download", body))
+    assert (status, result) == (202, {"jobId": JOB_ID})
+    args = json.loads(args_file.read_text())
+    assert args[:2] == ["job", "download-output"]
+    assert args[args.index("--job-id") + 1] == JOB_ID
+    assert {"--yes", "json", "create_copy"} <= set(args)
+    assert comfy.server.events == [
+        ("deadline.download", {"jobId": JOB_ID, "status": "DOWNLOADING", "progress": "50"}),
+        (
+            "deadline.download",
+            {
+                "jobId": JOB_ID,
+                "status": "DOWNLOADED",
+                "message": "Downloaded 2 files",
+                "fileCount": 2,
+            },
+        ),
+    ]
+
+
+def test_download_reads_stderr_while_waiting_for_the_summary(comfy, monkeypatch):
+    """A CLI that fills its stderr pipe before printing its summary still finishes."""
+    summary = {"messageType": "summary", "value": "Downloaded 1 file", "fileCount": 1}
+    fake_cli(monkeypatch, comfy.tmp_path, json.dumps(summary), stderr_noise=600_000)
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID}
+    run(asyncio.wait_for(call(comfy, "/deadline/jobs/download", body), 30))
+    assert comfy.server.events[-1][1]["status"] == "DOWNLOADED"
+
+
+def _long_summary() -> dict:
+    """A summary line well over asyncio's default 64 KiB line limit, as for a long frame range."""
+    files = [
+        f"/renders/shot_010/very_long_output_directory_name/fox_{i:05}.png" for i in range(3000)
+    ]
+    return {
+        "messageType": "summary",
+        "value": "Downloaded 3000 files",
+        "fileCount": 3000,
+        "files": files,
+    }
+
+
+def test_download_reports_a_summary_longer_than_the_default_line_limit(comfy, monkeypatch):
+    summary = _long_summary()
+    assert len(json.dumps(summary)) > 64 * 1024
+    fake_cli(monkeypatch, comfy.tmp_path, json.dumps(summary))
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID}
+    run(asyncio.wait_for(call(comfy, "/deadline/jobs/download", body), 30))
+    assert comfy.server.events[-1][1]["status"] == "DOWNLOADED"
+    assert comfy.server.events[-1][1]["fileCount"] == 3000
+
+
+def test_download_reports_output_it_cant_read(comfy, monkeypatch):
+    """The panel stops showing the download as running, whatever went wrong reading it."""
+    monkeypatch.setattr(comfy.routes, "DOWNLOAD_LINE_LIMIT", 1024)
+    fake_cli(monkeypatch, comfy.tmp_path, json.dumps(_long_summary()))
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID}
+    run(asyncio.wait_for(call(comfy, "/deadline/jobs/download", body), 30))
+    [(event, data)] = comfy.server.events
+    assert (event, data["status"]) == ("deadline.download", "FAILED")
+    assert "Couldn't read the CLI's output" in data["error"]
+
+
+def test_download_reports_failures(comfy, monkeypatch):
+    fake_cli(monkeypatch, comfy.tmp_path, "", exit_code=1, stderr="Credentials are expired")
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID}
+    run(call(comfy, "/deadline/jobs/download", body))
+    assert comfy.server.events[-1] == (
+        "deadline.download",
+        {"jobId": JOB_ID, "status": "FAILED", "error": "Credentials are expired"},
+    )
+
+
+def test_download_failures_log_stderr_indented(comfy, monkeypatch, caplog):
+    stderr = "Credentials are expired\nERROR forged entry"
+    fake_cli(monkeypatch, comfy.tmp_path, "", exit_code=1, stderr=stderr)
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID}
+    with caplog.at_level("ERROR", logger=comfy.routes.logger.name):
+        run(call(comfy, "/deadline/jobs/download", body))
+    message = caplog.records[-1].getMessage()
+    assert message.splitlines() == [
+        f"Couldn't download the outputs of {JOB_ID}:",
+        "    Credentials are expired",
+        "    ERROR forged entry",
+    ]
+
+
+def test_download_only_takes_deadline_ids(comfy, monkeypatch):
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": "--profile=evil"}
+    status, _ = run(call(comfy, "/deadline/jobs/download", body))
+    assert status == 400

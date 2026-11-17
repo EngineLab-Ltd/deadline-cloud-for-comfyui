@@ -161,6 +161,54 @@ if (scenario === "edited-before-replanning") {
   await ui.submit();
   await settle();
   result.excludedModels = api.calls.filter(({ path }) => path === "/deadline/jobs").at(-1).body.excludedModels;
+} else if (scenario.startsWith("poll-")) {
+  // Recent jobs' status, polled through the bridge's jobs command.
+  const job = { jobId: "job-1", name: "fox", farmId: "farm-1", queueId: "queue-1", submittedAt: "" };
+  state.jobs = [job];
+  let running = 0;
+  result.mostAtOnce = 0;
+  const answer = deferred();
+  api.handlers["/deadline/cloud/jobs"] = async (body) => {
+    running += 1;
+    result.mostAtOnce = Math.max(result.mostAtOnce, running);
+    if (scenario === "poll-overlapping") {
+      await answer.promise;
+    }
+    running -= 1;
+    const status =
+      scenario === "poll-error"
+        ? { jobId: "job-1", error: "Not found" }
+        : { jobId: "job-1", taskRunStatus: "RUNNING" };
+    return { jobs: [status] };
+  };
+  if (scenario === "poll-overlapping") {
+    // A job is submitted while the panel's first poll is still waiting for the bridge.
+    const first = ui.__pollJobs();
+    const second = ui.__pollJobs();
+    const third = ui.__pollJobs();
+    await settle();
+    answer.resolve();
+    await Promise.all([first, second, third]);
+  } else {
+    await ui.__pollJobs();
+    await ui.__pollJobs();
+  }
+  result.polls = api.calls.filter(({ path }) => path === "/deadline/cloud/jobs").length;
+} else if (scenario === "host-round-trip") {
+  // Editing the form rebuilds the requirements from it, so it has to hold every template value.
+  const requirements = {
+    attributes: [
+      { name: "attr.worker.os.family", anyOf: ["linux"] },
+      { name: "attr.worker.cpu.arch", anyOf: ["x86_64", "aarch64"] },
+    ],
+    amounts: [{ name: "amount.worker.gpu", min: 1 }],
+  };
+  result.requirements = ui.__requirementsFromForm(ui.__formFromRequirements(requirements));
+} else if (scenario === "download-nothing") {
+  state.jobs = [{ jobId: "job-1", name: "fox", farmId: "farm-1", queueId: "queue-1", submittedAt: "" }];
+  const message = "There are no output files available for download at this moment.";
+  api.emit("deadline.download", { jobId: "job-1", status: "DOWNLOADED", message, fileCount: 0 });
+  result.toasts = app.toasts.map(({ severity, detail }) => ({ severity, detail }));
 }
 console.log(JSON.stringify(result));
 process.exit(0);

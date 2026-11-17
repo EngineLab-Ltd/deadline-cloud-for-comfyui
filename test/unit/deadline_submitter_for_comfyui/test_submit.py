@@ -1,6 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 import json
 import os
+import re
 import stat
 from datetime import UTC, datetime
 from pathlib import Path
@@ -321,6 +322,84 @@ def test_create_job_bundle_keeps_json_template(tmp_path):
     template.write_text("{}")
     bundle_dir, _ = create_job_bundle(template, API_WORKFLOW, "w", tmp_path / "submissions")
     assert sorted(path.name for path in bundle_dir.iterdir()) == ["template.json", "w_api.json"]
+
+
+@pytest.mark.parametrize(
+    "requirements",
+    [
+        {"attributes": [{"name": "attr.worker.os.family", "anyOf": ["linux", "windows"]}]},
+        {"attributes": [{"name": "attr.worker.cpu.arch", "anyOf": ["x86_64"]}]},
+        {"amounts": [{"name": "amount.worker.vcpu", "min": 4, "max": 16}]},
+        {"amounts": [{"name": "amount.worker.memory", "min": 8192}]},
+        {"amounts": [{"name": "amount.worker.gpu.memory", "max": 24576}]},
+        {"amounts": [{"name": "amount.worker.disk.scratch", "min": 100}]},
+        {"amounts": [{"name": "amount.license.nuke", "min": 1}]},
+        {"attributes": [{"name": "attr.software.config", "allOf": ["a_b", "c-d"]}]},
+    ],
+)
+def test_host_requirements_openjd_accepts(requirements, tmp_path):
+    assert submit.host_requirements(requirements) == requirements
+    bundle_dir, _ = create_job_bundle(
+        submit.JOB_TEMPLATE, {}, "w", tmp_path, requirements=requirements
+    )
+    template = yaml.safe_load((bundle_dir / "template.yaml").read_text())
+    assert template["steps"][0]["hostRequirements"] == requirements
+    decode_job_template(template=template)
+
+
+@pytest.mark.parametrize(
+    ("requirements", "message"),
+    [
+        ("linux", "must be an object"),
+        ({"amounts": "gpu"}, "must be a list"),
+        ({"amounts": [1]}, "must be an object"),
+        ({"attributes": [1]}, "must be an object"),
+        ({"amounts": [{"name": "amount.worker.gpu"}]}, "needs a min or a max"),
+        ({"amounts": [{"name": "amount.worker.gpu", "min": -1}]}, "positive number"),
+        ({"amounts": [{"name": "amount.worker.gpu", "min": True}]}, "positive number"),
+        ({"amounts": [{"name": "amount.worker.gpu", "min": "1"}]}, "positive number"),
+        ({"amounts": [{"name": "amount.worker.gpu", "min": 2, "max": 1}]}, "more than its max"),
+        ({"amounts": [{"name": "amount.worker.other", "min": 1}]}, "doesn't start with"),
+        ({"amounts": [{"name": "amount.job.x", "min": 1}]}, "doesn't start with"),
+        ({"amounts": [{"name": "amount.", "min": 1}]}, "needs a name"),
+        ({"amounts": [{"name": "license", "min": 1}]}, "needs a name"),
+        ({"amounts": [{"name": "amount.a b", "min": 1}]}, "needs a name"),
+        ({"attributes": [{"name": "attr.task.x", "anyOf": ["a"]}]}, "doesn't start with"),
+        ({"attributes": [{"name": "attr.software"}]}, "either anyOf or allOf"),
+        ({"attributes": [{"name": "attr.a", "anyOf": ["a"], "allOf": ["b"]}]}, "either anyOf"),
+        ({"attributes": [{"name": "attr.a", "anyOf": []}]}, "needs values"),
+        ({"attributes": [{"name": "attr.a", "anyOf": ["$(id)"]}]}, "needs values"),
+    ],
+)
+def test_host_requirements_rejects(requirements, message):
+    with pytest.raises(SubmitError, match=re.escape(message)):
+        submit.host_requirements(requirements)
+
+
+def test_host_requirements_none_keeps_the_templates_and_empty_removes_them():
+    assert submit.host_requirements(None) is None
+    assert submit.host_requirements({}) == {}
+    assert submit.host_requirements({"attributes": [], "amounts": []}) == {}
+
+
+def test_create_job_bundle_can_remove_host_requirements(tmp_path):
+    bundle_dir, _ = create_job_bundle(submit.JOB_TEMPLATE, {}, "w", tmp_path, requirements={})
+    template = yaml.safe_load((bundle_dir / "template.yaml").read_text())
+    assert "hostRequirements" not in template["steps"][0]
+    decode_job_template(template=template)
+
+
+@pytest.mark.parametrize(
+    ("template", "expected"),
+    [
+        ({"steps": [{"hostRequirements": {"amounts": []}}]}, {"amounts": []}),
+        ({"steps": [{}]}, {}),
+        ({"steps": []}, {}),
+        ({}, {}),
+    ],
+)
+def test_template_host_requirements(template, expected):
+    assert submit.template_host_requirements(template) == expected
 
 
 def test_job_description():

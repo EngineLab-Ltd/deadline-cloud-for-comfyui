@@ -21,7 +21,7 @@ npm ci
 | `__init__.py` | The ComfyUI custom-node entry point. ComfyUI imports it from `custom_nodes/`. |
 | `install_submitter.py` | The setup script for users. It's tested in `test/unit/test_install_submitter.py`. |
 | `src/deadline/comfyui_submitter/submit.py` | Pure helpers for building the submitter command. They don't import ComfyUI, so they're unit tested. |
-| `src/deadline/comfyui_submitter/routes.py` | The `/deadline/...` routes on the ComfyUI server: `plan`, `cloud/<command>`, `jobs` and `choose`. |
+| `src/deadline/comfyui_submitter/routes.py` | The `/deadline/...` routes on the ComfyUI server: `plan`, `cloud/<command>`, `jobs`, `jobs/download`, `bundle` and `choose`. |
 | `src/deadline/comfyui_submitter/bridge.py` | Calls `deadline.client.api` for the routes. It runs in the Deadline Cloud CLI's Python (`python -I bridge.py <command>`) and speaks JSON lines, so it only imports the standard library and `deadline`. |
 | `frontend/src/extensions/deadline-cloud/` | The frontend extension's TypeScript. `deadline_submit.ts` registers the commands, the action bar button and the sidebar tab; `deadline_ui.ts` is the panel and the dialog, in plain DOM with ComfyUI's theme variables. The folder mirrors where ComfyUI serves the extension, so imports such as `../../scripts/app.js` resolve to the type declarations in `frontend/src/scripts/`. |
 | `src/deadline/comfyui_submitter/web/` | The compiled JavaScript that ComfyUI serves. It's built by `npm run build` in `frontend/`, which `install_submitter.py` runs, and isn't committed. |
@@ -66,9 +66,13 @@ a running ComfyUI, so test them by hand:
    default farm and queue, and, under **Attachments**, the models and input files the workflow
    loads.
 4. Submit an image-to-image workflow from the **Deadline** button's dialog, with its model on
-   this machine and **Extra Model Paths Config** empty. Check the upload progress and the job ID
-   notification. When the job finishes, run `deadline job download-output` and check that it
-   returns the image.
+   this machine and **Extra Model Paths Config** empty. Check the upload progress, the job ID
+   notification and the job's status under **Recent jobs**. When the job finishes, click
+   **Download** and check that the image is in ComfyUI's output directory.
+5. Click **Save job bundle**, and submit the saved bundle with `deadline bundle submit`.
+6. Change a host requirement, such as **GPU memory (GiB)**, submit, and check the job's host
+   requirements in Deadline Cloud monitor. Then check that **Reset to defaults** goes back to the
+   template's.
 
 To exercise the routes without the frontend:
 

@@ -16,10 +16,15 @@ GPU workers, with the models and input files it uses attached to the job.
   - the farm, queue and storage profile, saved as your Deadline Cloud defaults
   - job settings: name, description, priority, initial state, max failed tasks, retries and
     workers, how workers read attachments, and whether every input path has to exist
+  - [host requirements](#host-requirements), starting from the job template's
   - the job template's parameters, such as Workflow Timeout, and the queue's, such as Conda Channels
   - the input files and folders, and the models, to attach, which you can remove, or add to with a
     file dialog on the ComfyUI machine
-  - upload progress, and the job ID once it's submitted
+  - upload progress, the status of your recent jobs, and **Download** for their outputs, which
+    go back into the output directory they were submitted with
+  - **Save job bundle**, which creates the job bundle without submitting it, to submit later with
+    `deadline bundle submit`. The bundle keeps the parameters, host requirements, priority,
+    initial state, and the failed task, retry and worker limits. Pass the job name with `--name`.
 - A **Deadline** button next to **Run**, and **Workflow > Submit to Deadline Cloud…**, which open a
   short dialog: farm, queue and **Submit**.
 
@@ -175,10 +180,25 @@ uploaded from this machine. The workers have to provide the custom nodes:
 
 ## Host requirements
 
-The job runs on the workers that meet the job template's host requirements: the extension's
-template needs Linux and at least one GPU. To change them, use your own template through
-`COMFYUI_DEADLINE_JOB_TEMPLATE`. If no worker in the queue's fleets meets the requirements, the
-job's tasks wait until one does.
+The panel's **Host requirements** section says which workers can run the job. It starts from the
+job template's: the extension's template needs Linux and at least one GPU. Changing a field replaces
+the template's requirements with what's in the form, and **Reset to defaults** goes back to them.
+Clearing every field lets any worker run the job. The form starts from the template's first step,
+and what you set applies to every step of the job.
+
+| Field | Worker capability |
+|---|---|
+| Operating system | `attr.worker.os.family` |
+| CPU architecture | `attr.worker.cpu.arch` |
+| vCPUs | `amount.worker.vcpu` |
+| Memory (GiB) | `amount.worker.memory`, in MiB |
+| GPUs | `amount.worker.gpu` |
+| GPU memory (GiB) | `amount.worker.gpu.memory`, in MiB |
+| Scratch space (GiB) | `amount.worker.disk.scratch` |
+| Add amount | `amount.<name>`, such as a license count |
+| Add attribute | `attr.<name>`, with any or all of its values |
+
+If no worker in the queue's fleets meets the requirements, the job's tasks wait until one does.
 
 Large models need a bigger worker than the template's minimum. On a 16 GiB GPU such as a g4dn's T4,
 a video model with a large text encoder can run out of memory or take hours. For those workflows,
@@ -207,8 +227,8 @@ the same machine.
   `--enable-cors-header` turns off ComfyUI's own check.
 - They only accept JSON, which a page from another website can't send without the server's
   permission.
-- Submission progress, confirmation prompts and errors go only to the browser tab that started
-  them, not to every tab connected to the server.
+- Submission progress, confirmation prompts and errors, and download progress go only to the
+  browser tab that started them, not to every tab connected to the server.
 - Job bundles in `ComfyUI/user/deadline_submissions/` hold your workflows, prompts and file paths.
   On Linux and macOS that folder and each bundle in it can only be opened by the user that runs
   ComfyUI (mode `0700`), and the files the extension writes there can only be read by that user

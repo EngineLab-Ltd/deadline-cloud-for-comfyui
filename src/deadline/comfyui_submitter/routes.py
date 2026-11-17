@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import folder_paths
+import yaml
 from aiohttp import web
 from server import PromptServer
 
@@ -41,6 +42,7 @@ from .submit import (
     SubmitError,
     check_cli_version,
     create_job_bundle,
+    host_requirements,
     input_folders,
     job_description,
     load_config,
@@ -52,6 +54,7 @@ from .submit import (
     resolve_deadline_cli,
     resolve_job_template,
     template_defines_parameter,
+    template_host_requirements,
     validate_api_workflow,
     workflow_models,
     write_private_text,
@@ -62,10 +65,26 @@ logger = logging.getLogger(__name__)
 SUBMITTED_EVENT = "deadline.submitted"
 PROGRESS_EVENT = "deadline.progress"
 CONFIRM_EVENT = "deadline.confirm"
+DOWNLOAD_EVENT = "deadline.download"
+# A farm, queue or job ID, which goes on the CLI's command line.
+_RESOURCE_ID = re.compile(r"(farm|queue|job)-[0-9a-f]{32}")
+# download-output's JSON summary is one line that lists every downloaded file, so it can be far
+# longer than asyncio's default 64 KiB line limit.
+DOWNLOAD_LINE_LIMIT = 64 * 1024 * 1024
+# The job settings that a saved bundle keeps as deadline:<name> parameter values, which `deadline
+# bundle submit` reads.
+SAVED_JOB_SETTINGS = (
+    "priority",
+    "targetTaskRunStatus",
+    "maxFailedTasksCount",
+    "maxRetriesPerTask",
+    "maxWorkerCount",
+)
 _SUBMISSION_ID = re.compile(r"[0-9a-f]{32}")
 
 BRIDGE = Path(__file__).resolve().parent / "bridge.py"
-CLOUD_COMMANDS = ("status", "login", "farms", "queues", "queue", "set-defaults")
+# The bridge commands the panel can run directly.
+CLOUD_COMMANDS = ("status", "login", "farms", "queues", "queue", "set-defaults", "jobs")
 BRIDGE_TIMEOUT = 120
 # A first run of deadline --version can be slow, but it shouldn't hang.
 CLI_VERSION_TIMEOUT = 60
@@ -474,6 +493,7 @@ def _plan(body: dict[str, Any], workflow: dict[str, Any], template: Path) -> dic
             }
             for key, path in prepared.local_models.items()
         ],
+        "hostRequirements": template_host_requirements(job_template),
         "warnings": prepared.warnings,
     }
 
@@ -643,6 +663,7 @@ async def _build_bundle(
     parameters = _string_map(body.get("parameters"), "parameters")
     assets = _attachments(body.get("attachments"))
     excluded_models = _model_ids(body.get("excludedModels"))
+    requirements = host_requirements(body.get("hostRequirements"))
     description = job_description(body.get("description"))
 
     prepared = await asyncio.to_thread(_prepare, body, workflow, template, config)
@@ -655,6 +676,7 @@ async def _build_bundle(
         workflow,
         _workflow_name(body),
         _submissions_dir(),
+        requirements=requirements,
         description=description,
     )
     # Marked before the models are staged, so a bundle left by a crash while copying them is
@@ -677,6 +699,38 @@ async def _build_bundle(
     if staged.model_dir is not None:
         values["ModelDirectory"] = str(staged.model_dir)
     return _Bundle(bundle_dir, workflow_path, values, prepared.warnings)
+
+
+@PromptServer.instance.routes.post("/deadline/bundle")
+async def save_bundle(request: web.Request) -> web.Response:
+    """
+    Creates the job bundle and saves its parameter values, to submit later with `deadline bundle
+    submit`.
+    """
+    checked = await _read_request(request)
+    if isinstance(checked, web.Response):
+        return checked
+    body, workflow, template = checked
+    try:
+        settings = _string_map(body.get("settings"), "settings")
+        # A saved bundle is kept: it's submitted later, from this folder.
+        bundle = await _build_bundle(body, workflow, template, load_config(), submission=False)
+    except SubmitError as e:
+        return _error(400, str(e))
+    values: list[dict[str, Any]] = [
+        {"name": key, "value": str(value)} for key, value in bundle.values.items()
+    ]
+    # The library passes these to CreateJob as they are, so the numbers stay numbers.
+    values.extend(
+        {"name": f"deadline:{key}", "value": settings[key]}
+        for key in SAVED_JOB_SETTINGS
+        if settings.get(key) not in (None, "")
+    )
+    write_private_text(
+        bundle.bundle_dir / "parameter_values.yaml",
+        yaml.safe_dump({"parameterValues": values}, sort_keys=False),
+    )
+    return web.json_response({"job_bundle": str(bundle.bundle_dir), "warnings": bundle.warnings})
 
 
 @PromptServer.instance.routes.post("/deadline/jobs")
@@ -919,6 +973,126 @@ async def choose_paths(request: web.Request) -> web.Response:
     if process.returncode != 0:
         paths = []
     return web.json_response({"paths": [str(Path(path)) for path in paths if path]})
+
+
+def _cli_message(line: bytes) -> dict[str, Any] | None:
+    """A JSON line from the CLI's --output json."""
+    try:
+        message = json.loads(line)
+    except ValueError:
+        return None
+    return message if isinstance(message, dict) and "messageType" in message else None
+
+
+@PromptServer.instance.routes.post("/deadline/jobs/download")
+async def download_outputs(request: web.Request) -> web.Response:
+    """Downloads a job's outputs in the background, to the paths the job was submitted with."""
+    body = await _read_body(request)
+    if isinstance(body, web.Response):
+        return body
+    ids = [str(body.get(key)) for key in ("farmId", "queueId", "jobId")]
+    if not all(_RESOURCE_ID.fullmatch(value) for value in ids):
+        return _error(400, "farmId, queueId and jobId must be Deadline Cloud IDs.")
+    farm_id, queue_id, job_id = ids
+    try:
+        config = load_config()
+    except SubmitError as e:
+        return _error(400, str(e))
+    cli = await _checked_cli(config)
+    if isinstance(cli, web.Response):
+        return cli
+    command = [
+        cli,
+        "job",
+        "download-output",
+        "--farm-id",
+        farm_id,
+        "--queue-id",
+        queue_id,
+        "--job-id",
+        job_id,
+        "--conflict-resolution",
+        "create_copy",
+        "--output",
+        "json",
+        "--yes",
+    ]
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=DOWNLOAD_LINE_LIMIT,
+        )
+    except OSError as e:
+        return _error(500, f"Couldn't run the Deadline Cloud CLI: {e}")
+    _start(_watch_download(process, job_id, _client_id(body)))
+    return web.json_response({"jobId": job_id}, status=202)
+
+
+async def _watch_download(
+    process: asyncio.subprocess.Process, job_id: str, client_id: str | None = None
+) -> None:
+    assert process.stdout is not None and process.stderr is not None
+    summary = None
+    errors = []
+    # Read stderr while reading stdout, as _watch_submission does.
+    stderr_task = asyncio.create_task(process.stderr.read())
+    try:
+        async for line in process.stdout:
+            message = _cli_message(line)
+            if message is None:
+                continue
+            kind = message["messageType"]
+            if kind == "progress":
+                _send(
+                    DOWNLOAD_EVENT,
+                    {"jobId": job_id, "status": "DOWNLOADING", "progress": message["value"]},
+                    client_id,
+                )
+            elif kind == "summary":
+                summary = message
+            elif kind == "error":
+                errors.append(str(message.get("value")))
+        stderr = await stderr_task
+        await process.wait()
+    except Exception as e:
+        # Any failure, such as a line over the limit, still ends the panel's download.
+        logger.exception("Couldn't read the download of %s", _log_value(job_id))
+        if process.returncode is None:
+            process.kill()
+        await process.wait()
+        _send(
+            DOWNLOAD_EVENT,
+            {"jobId": job_id, "status": "FAILED", "error": f"Couldn't read the CLI's output: {e}"},
+            client_id,
+        )
+        return
+    finally:
+        stderr_task.cancel()
+    if process.returncode == 0 and summary is not None:
+        _send(
+            DOWNLOAD_EVENT,
+            {
+                "jobId": job_id,
+                "status": "DOWNLOADED",
+                "message": str(summary.get("value")),
+                "fileCount": summary.get("fileCount", 0),
+            },
+            client_id,
+        )
+        return
+    text = stderr.decode(errors="replace")
+    logger.error(
+        "Couldn't download the outputs of %s:\n    %s", _log_value(job_id), _log_block(text)
+    )
+    last_line = next((line for line in reversed(text.splitlines()) if line.strip()), "")
+    _send(
+        DOWNLOAD_EVENT,
+        {"jobId": job_id, "status": "FAILED", "error": (errors or [last_line.strip()])[-1]},
+        client_id,
+    )
 
 
 # Deletes old bundles in the background, so ComfyUI's start doesn't wait on slow storage.

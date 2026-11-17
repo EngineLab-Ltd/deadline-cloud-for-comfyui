@@ -55,7 +55,9 @@ def _run_scenario(tmp_path: Path, ui_source: str, scenario: str) -> dict:
     # and every scenario fail, if one of them is missing.
     exports = (
         "\nexport { state as __state, queueParameterValue as __queueParameterValue,"
-        " parameterControl as __parameterControl, RENDERERS as __renderers };\n"
+        " parameterControl as __parameterControl, RENDERERS as __renderers,"
+        " pollJobs as __pollJobs, formFromRequirements as __formFromRequirements,"
+        " requirementsFromForm as __requirementsFromForm };\n"
     )
     (web / "deadline_ui.js").write_text(ui_source + exports, encoding="utf-8")
     (tmp_path / "package.json").write_text('{"type": "module"}')
@@ -136,3 +138,38 @@ def test_a_model_is_removed_by_its_folder_and_name(run_scenario):
     """Two models with the same file name, in different folders, are removed one at a time."""
     result = run_scenario("same-name-models")
     assert result["excludedModels"] == ["loras/shared.safetensors"]
+
+
+def test_overlapping_job_polls_run_one_at_a_time(run_scenario):
+    """A poll asked for during another runs once after it, rather than starting a second loop."""
+    result = run_scenario("poll-overlapping")
+    assert result["mostAtOnce"] == 1
+    assert result["polls"] == 2
+
+
+def test_a_job_whose_status_cant_be_read_isnt_polled_again(run_scenario):
+    """A deleted job, or one from another account, would otherwise cost a bridge call each poll."""
+    assert run_scenario("poll-error")["polls"] == 1
+
+
+def test_a_running_job_is_polled_again(run_scenario):
+    assert run_scenario("poll-running")["polls"] == 2
+
+
+def test_a_download_with_no_outputs_says_so(run_scenario):
+    [toast] = run_scenario("download-nothing")["toasts"]
+    assert toast == {
+        "severity": "info",
+        "detail": "fox: There are no output files available for download at this moment.",
+    }
+
+
+def test_host_requirement_values_without_a_checkbox_are_kept(run_scenario):
+    """aarch64 has no checkbox, so CPU architecture stays a custom attribute with both values."""
+    assert run_scenario("host-round-trip")["requirements"] == {
+        "attributes": [
+            {"name": "attr.worker.os.family", "anyOf": ["linux"]},
+            {"name": "attr.worker.cpu.arch", "anyOf": ["x86_64", "aarch64"]},
+        ],
+        "amounts": [{"name": "amount.worker.gpu", "min": 1}],
+    }

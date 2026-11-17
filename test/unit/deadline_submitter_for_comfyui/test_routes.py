@@ -988,3 +988,249 @@ def test_a_hung_cli_version_check_is_killed(comfy, monkeypatch):
         run(comfy.routes._cli_version_output(str(cli)))
     with pytest.raises(ProcessLookupError):
         os.kill(int(pid_file.read_text()), 0)
+
+
+def test_jobs_submits_when_local_model_staging_fails(comfy, monkeypatch):
+    fake_tools(monkeypatch, comfy.tmp_path)
+    checkpoint = comfy.tmp_path / "models" / "checkpoints" / "m.safetensors"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"model")
+
+    def fail(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(comfy.routes, "stage_local_models", fail)
+    status, body = run(post(comfy, {"workflow": WORKFLOW}))
+    assert status == 202
+    assert len(body["warnings"]) == 1
+    assert "m.safetensors won't be attached" in body["warnings"][0]
+
+
+def test_save_asset_references_merges_staged_files_with_the_workflows_inputs(comfy):
+    """The scanned input files are kept, models aren't scanned, and staged extras are added once."""
+    image = comfy.tmp_path / "input" / "cat.png"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"png")
+    model = comfy.tmp_path / "models" / "checkpoints" / "m.safetensors"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"model")
+    workflow = {
+        "1": {"class_type": "LoadImage", "inputs": {"image": "cat.png"}},
+        "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "m.safetensors"}},
+    }
+    bundle = comfy.tmp_path / "bundle"
+    bundle.mkdir()
+    comfy.routes._save_asset_references(workflow, bundle, extra_filenames=[model, image])
+    inputs = yaml.safe_load((bundle / "asset_references.yaml").read_text())["assetReferences"][
+        "inputs"
+    ]
+    assert inputs == {"filenames": sorted([str(image), str(model)]), "directories": []}
+
+
+def test_jobs_lists_local_models_in_asset_references(comfy, monkeypatch):
+    """Every model the workflow loads is attached, whether or not its loader records a URL."""
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    checkpoints = comfy.tmp_path / "models" / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    local = checkpoints / "local.safetensors"
+    local.write_bytes(b"model")
+    (checkpoints / "other.safetensors").write_bytes(b"model")
+    downloadable = checkpoints / "downloadable.safetensors"
+    downloadable.write_bytes(b"model")
+    ui_workflow = {
+        "nodes": [
+            {
+                "type": "CheckpointLoaderSimple",
+                "properties": {
+                    "models": [
+                        {"directory": "checkpoints", "name": "local.safetensors"},
+                        {
+                            "directory": "checkpoints",
+                            "name": "downloadable.safetensors",
+                            "url": "https://x.test/downloadable.safetensors",
+                        },
+                    ]
+                },
+            }
+        ]
+    }
+    workflow = {
+        "4": {
+            "class_type": "CheckpointLoaderSimple",
+            "inputs": {"ckpt_name": "local.safetensors"},
+        },
+        "5": {
+            "class_type": "CheckpointLoaderSimple",
+            "inputs": {"ckpt_name": "downloadable.safetensors"},
+        },
+        "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "comfyui"}},
+    }
+    status, body = run(
+        post(comfy, {"workflow": workflow, "ui_workflow": ui_workflow, "name": "mixed"})
+    )
+    assert status == 202
+    bundle = Path(body["job_bundle"])
+    written = json.loads(Path(body["workflow_file"]).read_text())
+    assert written["4"]["inputs"]["ckpt_name"] == "local.safetensors"
+    staged = [
+        bundle / "local_models" / "checkpoints" / name
+        for name in ("downloadable.safetensors", "local.safetensors")
+    ]
+    references = yaml.safe_load((bundle / "asset_references.yaml").read_text())
+    assert references["assetReferences"]["inputs"]["filenames"] == [str(path) for path in staged]
+    assert references["assetReferences"]["inputs"]["directories"] == []
+    assert not (bundle / "local_models" / "checkpoints" / "other.safetensors").exists()
+    parameters = sent_parameters(requests)
+    assert parameters["ModelDirectory"] == str(bundle / "local_models")
+    assert body["warnings"] == []
+
+
+def test_model_directory_does_not_upload_its_contents():
+    template = yaml.safe_load(submit.JOB_TEMPLATE.read_text())
+    parameter = next(
+        item for item in template["parameterDefinitions"] if item["name"] == "ModelDirectory"
+    )
+    assert parameter["dataFlow"] == "NONE"
+    assert parameter["objectType"] == "DIRECTORY"
+
+
+def test_jobs_warns_about_models_it_cant_attach(comfy, monkeypatch):
+    fake_tools(monkeypatch, comfy.tmp_path)
+    status, body = run(post(comfy, {"workflow": WORKFLOW}))
+    assert status == 202
+    assert len(body["warnings"]) == 1
+    assert "m.safetensors won't be attached" in body["warnings"][0]
+
+
+def _local_checkpoint(comfy, name="m.safetensors"):
+    checkpoint = comfy.tmp_path / "models" / "checkpoints" / name
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"model")
+    return checkpoint
+
+
+def test_plan_lists_local_models_and_doesnt_warn_about_them(comfy, monkeypatch):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    checkpoint = _local_checkpoint(comfy)
+    status, body = run(call(comfy, "/deadline/plan", {"workflow": WORKFLOW, "name": "fox"}))
+    assert status == 200
+    assert body["localModels"] == [
+        {"name": "m.safetensors", "directory": "checkpoints", "path": str(checkpoint)}
+    ]
+    assert body["warnings"] == []
+    # Planning doesn't stage anything.
+    assert not (comfy.tmp_path / "user" / "deadline_submissions").exists()
+
+
+def test_plan_warns_about_models_with_no_local_file(comfy, monkeypatch):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    status, body = run(call(comfy, "/deadline/plan", {"workflow": WORKFLOW, "name": "fox"}))
+    assert status == 200
+    assert body["localModels"] == []
+    assert "m.safetensors won't be attached" in body["warnings"][0]
+
+
+def test_jobs_attaches_local_models_through_model_directory(comfy, monkeypatch):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    checkpoint = _local_checkpoint(comfy)
+    requests = fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [result({"jobId": "job-1"})]})
+    # The panel sends the hidden directory's empty default, and a file of the artist's own.
+    body = {
+        **JOB,
+        "parameters": {"ModelDirectory": ""},
+        "attachments": {"filenames": ["/a/fox.png"], "directories": []},
+    }
+    status, response = run(call(comfy, "/deadline/jobs", body))
+    assert status == 202
+    assert response["warnings"] == []
+    bundle = Path(response["job_bundle"])
+    staged = bundle / "local_models" / "checkpoints" / "m.safetensors"
+    assert staged.stat().st_ino == checkpoint.stat().st_ino
+    references = yaml.safe_load((bundle / "asset_references.yaml").read_text())
+    assert references["assetReferences"]["inputs"]["filenames"] == sorted(
+        ["/a/fox.png", str(staged)]
+    )
+    sent = bridge_requests(requests)[0]["request"]["parameters"]
+    assert sent["ModelDirectory"] == str(bundle / "local_models")
+
+
+def test_jobs_doesnt_attach_a_local_model_the_artist_removed(comfy, monkeypatch):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    _local_checkpoint(comfy)
+    requests = fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [result({"jobId": "job-1"})]})
+    body = {**JOB, "parameters": {"ModelDirectory": ""}, "excludedModels": ["m.safetensors"]}
+    status, response = run(call(comfy, "/deadline/jobs", body))
+    assert status == 202
+    assert len(response["warnings"]) == 1
+    assert "m.safetensors won't be attached" in response["warnings"][0]
+    bundle = Path(response["job_bundle"])
+    assert not (bundle / "local_models").exists()
+    references = yaml.safe_load((bundle / "asset_references.yaml").read_text())
+    assert not references["assetReferences"]["inputs"]["filenames"]
+    assert bridge_requests(requests)[0]["request"]["parameters"]["ModelDirectory"] == ""
+
+
+def test_jobs_attaches_the_local_models_the_artist_kept(comfy, monkeypatch):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    _local_checkpoint(comfy)
+    fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [result({"jobId": "job-1"})]})
+    body = {**JOB, "parameters": {}, "excludedModels": ["other.safetensors"]}
+    status, response = run(call(comfy, "/deadline/jobs", body))
+    assert status == 202
+    assert response["warnings"] == []
+    staged = Path(response["job_bundle"]) / "local_models" / "checkpoints" / "m.safetensors"
+    assert staged.is_file()
+
+
+@pytest.mark.parametrize("excluded", ["m.safetensors", [1], {"m.safetensors": True}])
+def test_jobs_rejects_bad_excluded_models(comfy, monkeypatch, excluded):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    fake_bridge(monkeypatch, comfy.tmp_path, {})
+    status, response = run(
+        call(comfy, "/deadline/jobs", {**JOB, "parameters": {}, "excludedModels": excluded})
+    )
+    assert status == 400
+    assert "excludedModels" in response["error"]
+
+
+def test_jobs_keeps_the_artists_model_directory_when_nothing_is_attached(comfy, monkeypatch):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    requests = fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [result({"jobId": "job-1"})]})
+    body = {**JOB, "parameters": {"ModelDirectory": "/shared/models"}}
+    status, _ = run(call(comfy, "/deadline/jobs", body))
+    assert status == 202
+    sent = bridge_requests(requests)[0]["request"]["parameters"]
+    assert sent["ModelDirectory"] == "/shared/models"
+
+
+def test_jobs_warns_when_a_planned_local_model_cant_be_staged(comfy, monkeypatch):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    _local_checkpoint(comfy)
+    requests = fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [result({"jobId": "job-1"})]})
+
+    def fail(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(comfy.routes, "stage_local_models", fail)
+    status, response = run(call(comfy, "/deadline/jobs", {**JOB, "parameters": {}}))
+    assert status == 202
+    assert len(response["warnings"]) == 1
+    assert "m.safetensors won't be attached" in response["warnings"][0]
+    assert "ModelDirectory" not in bridge_requests(requests)[0]["request"]["parameters"]
+
+
+def test_templates_without_model_directory_dont_attach_local_models(comfy, monkeypatch):
+    template = comfy.tmp_path / "template.yaml"
+    template.write_text(
+        "specificationVersion: jobtemplate-2023-09\nname: x\n"
+        "parameterDefinitions:\n- name: WorkflowFile\n  type: PATH\n"
+        "steps:\n- name: s\n  script:\n    actions:\n      onRun:\n        command: 'true'\n"
+    )
+    monkeypatch.setenv(submit.TEMPLATE_ENV_VAR, str(template))
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    _local_checkpoint(comfy)
+    status, body = run(post(comfy, {"workflow": WORKFLOW}))
+    assert status == 202
+    assert "m.safetensors won't be attached" in body["warnings"][0]
+    assert not (Path(body["job_bundle"]) / "local_models").exists()
+    assert "ModelDirectory" not in sent_parameters(requests)

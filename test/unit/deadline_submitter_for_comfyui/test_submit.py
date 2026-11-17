@@ -24,7 +24,9 @@ from deadline.comfyui_submitter.submit import (
     resolve_deadline_cli,
     resolve_job_template,
     safe_name,
+    template_defines_parameter,
     validate_api_workflow,
+    workflow_models,
 )
 
 API_WORKFLOW = {
@@ -224,6 +226,39 @@ def test_validate_api_workflow_finds_missing_node_in_subgraph():
     }
     with pytest.raises(SubmitError, match=r"node 12:137 \(MissingNode\)"):
         validate_api_workflow({**API_WORKFLOW, "12:137": {"inputs": {}}}, ui_workflow)
+
+
+def test_workflow_models():
+    workflow = {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sdxl.safetensors"}},
+        "2": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}},
+        "3": {"class_type": "LoraLoader", "inputs": {"lora_name": "styles\\Ink.SAFETENSORS"}},
+        "4": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": "flux/q4.gguf"}},
+        "5": {"class_type": "CLIPTextEncode", "inputs": {"text": "a cat", "clip": ["1", 1]}},
+        "6": {"class_type": "LoadImage", "inputs": {"image": "photo.png"}},
+    }
+    assert workflow_models(workflow) == [
+        "ae.safetensors",
+        "flux/q4.gguf",
+        "sdxl.safetensors",
+        "styles/Ink.SAFETENSORS",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("parameterDefinitions:\n- name: ModelDirectory\n  type: PATH\n", True),
+        ("parameterDefinitions:\n  - name: 'ModelDirectory'\n", True),
+        ('{"parameterDefinitions": [{"name": "ModelDirectory", "type": "PATH"}]}', True),
+        ("parameterDefinitions:\n- name: ModelDir\n", False),
+        ("description: set ModelDirectory to attach models\n", False),
+    ],
+)
+def test_template_defines_parameter(tmp_path, content, expected):
+    template = tmp_path / "template.yaml"
+    template.write_text(content, encoding="utf-8")
+    assert template_defines_parameter(template, "ModelDirectory") is expected
 
 
 @pytest.mark.parametrize(

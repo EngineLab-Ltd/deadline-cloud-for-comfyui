@@ -61,6 +61,7 @@ interface Plan {
   values?: Record<string, ParameterValue>;
   queueValues?: Record<string, string>;
   attachments?: PathLists;
+  localModels?: { name: string; directory: string | null; path: string }[];
   warnings?: string[];
 }
 
@@ -586,6 +587,7 @@ function bundleRequest() {
     settings,
     description: state.jobDescription.trim(),
     attachments: attachments(),
+    excludedModels: excludedModels(),
   };
 }
 
@@ -992,6 +994,16 @@ function renderStatus() {
     for (const warning of plan.warnings ?? []) {
       children.push(h("div", { className: "dl-notice dl-warn-box" }, warning));
     }
+    const excluded = excludedModels();
+    if (excluded.length) {
+      children.push(
+        h(
+          "div",
+          { className: "dl-notice dl-warn-box" },
+          `Not attaching ${excluded.join(", ")}. The job fails unless the workers already have it, for example through Extra Model Paths Config.`
+        )
+      );
+    }
   }
   children.push(
     h(
@@ -1206,6 +1218,12 @@ function renderJobSettings() {
   );
 }
 
+function excludedModels(): string[] {
+  return (state.plan?.localModels ?? [])
+    .filter((model) => state.removedAttachments.has(model.path))
+    .map((model) => model.name);
+}
+
 function attachmentItem(
   text: string,
   path: string,
@@ -1253,7 +1271,11 @@ function renderAttachments() {
       }
     }
   }
-  const attachedCount = [...rows.keys()].filter((path) => !state.removedAttachments.has(path)).length;
+  const localModels = state.plan.localModels ?? [];
+  const attachedCount =
+    [...rows.keys()].filter((path) => !state.removedAttachments.has(path)).length +
+    localModels.length -
+    excludedModels().length;
   const remove = (row: Row) => () => {
     if (row.manual) {
       added[row.key] = added[row.key].filter((path) => path !== row.path);
@@ -1265,6 +1287,15 @@ function renderAttachments() {
   const restore = (row: Row) => () => {
     state.removedAttachments.delete(row.path);
     refresh("attachments");
+  };
+  // Removing a model can make the job fail, so the status warns about it.
+  const toggleModel = (model: { path: string }, removed: boolean) => () => {
+    if (removed) {
+      state.removedAttachments.add(model.path);
+    } else {
+      state.removedAttachments.delete(model.path);
+    }
+    refresh("status", "attachments");
   };
   // The dialog opens on the ComfyUI machine, whose files the job attaches.
   const add = (kind: string, key: keyof PathLists) => async () => {
@@ -1291,6 +1322,24 @@ function renderAttachments() {
       { className: "dl-help" },
       "The input files and folders uploaded with the job, from the ComfyUI machine. Outputs come back to the output directory."
     ),
+    localModels.length
+      ? [
+          h("div", { className: "dl-label" }, "Models the workflow loads, attached automatically"),
+          h(
+            "ul",
+            { className: "dl-files" },
+            localModels.map((model) =>
+              attachmentItem(
+                model.name,
+                model.path,
+                null,
+                toggleModel(model, true),
+                toggleModel(model, false)
+              )
+            )
+          ),
+        ]
+      : null,
     rows.size
       ? h(
           "ul",

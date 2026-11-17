@@ -2,7 +2,8 @@ specificationVersion: 'jobtemplate-2023-09'
 name: ComfyUI Workflow (comfy-cli)
 description: >
   Runs a ComfyUI workflow headlessly with comfy-cli. A job environment starts ComfyUI once
-  per session with comfy launch, and the task runs the workflow with comfy run.
+  per session with comfy launch, loading the models attached to the job, and the task runs
+  the workflow with comfy run.
 
 parameterDefinitions:
 
@@ -50,6 +51,19 @@ parameterDefinitions:
     Choose the output directory. ComfyUI writes the outputs of Save nodes here.
 
 # Model Parameters
+- name: ModelDirectory
+  type: PATH
+  objectType: DIRECTORY
+  dataFlow: NONE
+  userInterface:
+    control: HIDDEN
+  default: ""
+  description: >
+    A directory of model files, laid out like ComfyUI's models folder with
+    subfolders such as checkpoints, loras and vae. Only the files the workflow
+    loads are attached to the job, not the whole directory. ComfyUI on the
+    worker reads them from where they're mapped. Leave empty when the workers
+    already have every model, for example through an extra model paths config.
 - name: ExtraModelPathsConfig
   type: STRING
   userInterface:
@@ -60,7 +74,7 @@ parameterDefinitions:
   description: >
     Optional path, on the worker, to an extra_model_paths.yaml file that points
     ComfyUI at more model folders or custom_nodes folders, for example on shared
-    storage.
+    storage. ComfyUI also searches the models attached to the job.
 
 # Advanced Parameters
 - name: ComfyUIArgs
@@ -132,6 +146,20 @@ jobEnvironments:
         #!/bin/env bash
         set -euo pipefail
 
+        # Prints an extra model paths entry for each model folder in a directory, such as loras/ or
+        # style_models/. Each folder is named after the ComfyUI model folder type it holds, so any
+        # type the submitter attaches is found, not only a fixed list.
+        model_folders() {
+            local FOLDER NAME
+            for FOLDER in "$1"/*/; do
+                [ -d "$FOLDER" ] || continue
+                NAME="$(basename "$FOLDER")"
+                if [[ "$NAME" =~ ^[A-Za-z0-9_]+$ ]]; then
+                    echo "    $NAME: $NAME/"
+                fi
+            done
+        }
+
         MODEL_PATHS='{{Session.WorkingDirectory}}/extra_model_paths.yaml'
         : > "$MODEL_PATHS"
         if [ -n "${COMFYUI_CUSTOM_NODES_DIR:-}" ] && [ -d "$COMFYUI_CUSTOM_NODES_DIR" ]; then
@@ -140,6 +168,15 @@ jobEnvironments:
             custom_nodes: $COMFYUI_CUSTOM_NODES_DIR
         EOF
             echo "Custom nodes from the conda environment: $(ls "$COMFYUI_CUSTOM_NODES_DIR" | xargs)"
+        fi
+        # Path mapping turns ModelDirectory into the folder where the model files were attached.
+        if [ -n '{{Param.ModelDirectory}}' ] && [ -d '{{Param.ModelDirectory}}' ]; then
+            cat >> "$MODEL_PATHS" <<EOF
+        model_directory:
+            base_path: '{{Param.ModelDirectory}}'
+        EOF
+            model_folders '{{Param.ModelDirectory}}' >> "$MODEL_PATHS"
+            echo "Attached model folders: $(ls '{{Param.ModelDirectory}}' | xargs)"
         fi
         # ComfyUI can't read an empty extra model paths file, so it's only passed with entries.
         MODEL_PATH_FILES=()

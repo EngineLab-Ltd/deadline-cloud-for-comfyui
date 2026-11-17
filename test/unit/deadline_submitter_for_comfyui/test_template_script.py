@@ -107,24 +107,29 @@ def comfy_calls(tmp_path: Path) -> list[list[str]]:
     return [json.loads(line) for line in lines]
 
 
-def enter_script(tmp_path: Path, start: str, end: str, extra: str = "") -> str:
-    """Part of the server environment's Enter script, with the job's values filled in."""
+def enter_script(
+    tmp_path: Path, end: str, model_directory: Path | None = None, extra: str = ""
+) -> str:
+    """The start of the server environment's Enter script, with the job's values filled in."""
     [environment] = TEMPLATE["jobEnvironments"]
     [enter] = [f for f in environment["script"]["embeddedFiles"] if f["name"] == "Enter"]
     data = enter["data"]
     return (
-        data[data.index(start) : data.index(end)]
+        data[data.index("model_folders() {") : data.index(end)]
         .replace("{{Session.WorkingDirectory}}", str(tmp_path))
+        .replace("{{Param.ModelDirectory}}", str(model_directory or ""))
         .replace("{{Param.ExtraModelPathsConfig}}", extra)
     )
 
 
-def write_model_paths(tmp_path: Path, conda_nodes: Path | None = None) -> Any:
+def write_model_paths(
+    tmp_path: Path, model_directory: Path | None = None, conda_nodes: Path | None = None
+) -> Any:
     """
     Runs the part of the Enter script that writes extra_model_paths.yaml, and returns the config
     it wrote.
     """
-    script = enter_script(tmp_path, "MODEL_PATHS=", "# ComfyUI can't read an empty")
+    script = enter_script(tmp_path, "# ComfyUI can't read an empty", model_directory)
     result = subprocess.run(
         ["bash", "-c", "set -euo pipefail\n" + script],
         env={
@@ -139,22 +144,44 @@ def write_model_paths(tmp_path: Path, conda_nodes: Path | None = None) -> Any:
     return yaml.safe_load((tmp_path / "extra_model_paths.yaml").read_text())
 
 
-def test_model_paths_are_empty_without_conda_custom_nodes(tmp_path):
+def test_model_paths_map_every_attached_model_folder(tmp_path):
+    """Folders outside the common ones, such as style_models, are mapped too."""
+    attached = tmp_path / "attached models"
+    for folder in (attached / "loras", attached / "style_models"):
+        folder.mkdir(parents=True)
+    # Not a model folder type name, so it's left out rather than written as a YAML key.
+    (attached / "bad: name").mkdir()
+    assert write_model_paths(tmp_path, attached) == {
+        "model_directory": {
+            "base_path": str(attached),
+            "loras": "loras/",
+            "style_models": "style_models/",
+        },
+    }
+
+
+def test_model_paths_are_empty_without_models_or_conda_custom_nodes(tmp_path):
     """The file stays empty, and the Enter script then doesn't pass it to ComfyUI."""
     assert write_model_paths(tmp_path) is None
+    assert write_model_paths(tmp_path, tmp_path / "missing") is None
 
 
 def test_model_paths_add_the_conda_environments_custom_nodes(tmp_path):
     conda_nodes = tmp_path / "conda custom_nodes"
     conda_nodes.mkdir()
-    assert write_model_paths(tmp_path, conda_nodes) == {
+    assert write_model_paths(tmp_path, conda_nodes=conda_nodes) == {
         "conda_custom_nodes": {"custom_nodes": str(conda_nodes)}
     }
 
 
-def model_path_args(tmp_path: Path, extra: str = "", conda_nodes: Path | None = None) -> list[str]:
+def model_path_args(
+    tmp_path: Path,
+    extra: str = "",
+    conda_nodes: Path | None = None,
+    model_directory: Path | None = None,
+) -> list[str]:
     """The extra model paths arguments the Enter script passes to ComfyUI."""
-    script = enter_script(tmp_path, "MODEL_PATHS=", "# Keep ComfyUI's data out", extra)
+    script = enter_script(tmp_path, "# Keep ComfyUI's data out", model_directory, extra)
     result = subprocess.run(
         [
             "bash",
@@ -187,6 +214,17 @@ def test_conda_custom_nodes_and_the_studio_config_are_both_passed(tmp_path):
     conda_nodes.mkdir()
     studio = "/mnt/studio/extra_model_paths.yaml"
     assert model_path_args(tmp_path, studio, conda_nodes) == [
+        "--extra-model-paths-config",
+        str(tmp_path / "extra_model_paths.yaml"),
+        studio,
+    ]
+
+
+def test_attached_models_and_the_studio_config_are_both_passed(tmp_path):
+    attached = tmp_path / "models"
+    (attached / "loras").mkdir(parents=True)
+    studio = "/mnt/studio/extra_model_paths.yaml"
+    assert model_path_args(tmp_path, studio, model_directory=attached) == [
         "--extra-model-paths-config",
         str(tmp_path / "extra_model_paths.yaml"),
         studio,

@@ -7,7 +7,7 @@
 
 A ComfyUI extension that submits the open workflow to [AWS Deadline Cloud](https://aws.amazon.com/deadline-cloud/),
 from a **Deadline** panel and dialog inside ComfyUI. The job runs the workflow on Deadline Cloud
-GPU workers, with the input files it uses attached to the job.
+GPU workers, with the models and input files it uses attached to the job.
 
 ## What it adds
 
@@ -17,8 +17,8 @@ GPU workers, with the input files it uses attached to the job.
   - job settings: name, description, priority, initial state, max failed tasks, retries and
     workers, how workers read attachments, and whether every input path has to exist
   - the job template's parameters, such as Workflow Timeout, and the queue's, such as Conda Channels
-  - the input files and folders to attach, which you can remove, or add to with a file dialog on
-    the ComfyUI machine
+  - the input files and folders, and the models, to attach, which you can remove, or add to with a
+    file dialog on the ComfyUI machine
   - upload progress, and the job ID once it's submitted
 - A **Deadline** button next to **Run**, and **Workflow > Submit to Deadline Cloud…**, which open a
   short dialog: farm, queue and **Submit**.
@@ -39,6 +39,7 @@ When you submit, the extension:
    | Workflow File | The saved API-format workflow |
    | Output Directory | ComfyUI's output directory |
    | Input Directory | ComfyUI's input directory, so load nodes on the worker find the attached input files |
+   | Model Directory | The bundle's folder of attached models, so ComfyUI on the worker finds them |
 
 4. Shows the hashing and upload progress, asks you to confirm when Deadline Cloud would (for
    example, to upload files outside the storage profile), and then shows the job ID.
@@ -127,7 +128,7 @@ the environment that starts ComfyUI.
 | `COMFYUI_DEADLINE_CLI` | `deadline_cli` in the config, then `deadline` on the `PATH` | The Deadline Cloud CLI executable. |
 | `COMFYUI_DEADLINE_CONDA_CHANNELS` | `conda_channels` in the config | Optional **Conda Channels** to fill in. When neither is set, the queue's default, the Deadline Cloud channels, is used. |
 | `COMFYUI_DEADLINE_CONFIG` | `deadline_cloud_submitter.json` in the extension folder | Another config file to read. |
-| `COMFYUI_DEADLINE_JOB_TEMPLATE` | The extension's job template | A job template file, YAML or JSON, to submit instead, such as your studio's version of the extension's template. It needs the same parameters, such as `WorkflowFile`, `InputDir` and `OutputDir`. |
+| `COMFYUI_DEADLINE_JOB_TEMPLATE` | The extension's job template | A job template file, YAML or JSON, to submit instead, such as your studio's version of the extension's template. It needs the same parameters, such as `WorkflowFile`, `InputDir` and `OutputDir`. Local models are attached only when the template also defines `ModelDirectory`, and it has to point ComfyUI at that folder. The extension's template does. |
 | `COMFYUI_DEADLINE_ALLOW_REMOTE` | unset | Set it to `1` to accept submit requests from browsers on other machines or through a reverse proxy. See [Security](#security) first. |
 
 ## The job
@@ -146,8 +147,8 @@ Each task runs the workflow for up to **Workflow Timeout**, an hour by default. 
 waits that long for ComfyUI to report progress, since loading a large model can take minutes
 without any. Raise it for long video workflows.
 
-The job runs the workflow once, as one task. Input files are attached to the job, uploaded from
-this machine. The workers have to provide the models and custom nodes:
+The job runs the workflow once, as one task. Input files and models are attached to the job,
+uploaded from this machine. The workers have to provide the custom nodes:
 
 - **Input files.** The submitter lists the files in ComfyUI's input directory that the workflow
   loads, such as Load Image's image, in the job bundle's `asset_references.yaml`, with the whole
@@ -155,10 +156,16 @@ this machine. The workers have to provide the models and custom nodes:
   **Input Directory** at them on the worker.
 - **Outputs.** Outputs are returned through job attachments. Download them with Deadline Cloud
   monitor or `deadline job download-output`.
-- **Models.** The job doesn't download models. Point **Extra Model Paths Config** at an
-  `extra_model_paths.yaml` on the workers that lists the model folders on shared storage, such as
-  an Amazon FSx or Amazon EFS file system the fleet mounts. ComfyUI on the worker loads each model
-  by the name already in the workflow.
+- **Models.** Workers don't have your local models. The submitter finds each model file the
+  workflow loads in ComfyUI's model folders, the way ComfyUI would, and places it in the job
+  bundle under **Model Directory**, in that model's folder (`checkpoints/`, `loras/`, and so on).
+  Those files are job attachments. Each one is uploaded once, and later jobs reuse it. On the
+  worker, **Model Directory** is the folder those files are mapped to, and ComfyUI loads each
+  model by the name already in the workflow. The job doesn't download models from the internet.
+  When a model isn't on this machine, the panel warns about it, and the job fails unless the
+  workers already have the model, such as in a shared folder that **Extra Model Paths Config**
+  points at. In the panel, **Attachments** lists the models it will attach. Remove one with its
+  **✕** when the workers already have it, and it isn't uploaded.
 - **Custom nodes.** Workers load the custom nodes in the job's conda environment, such as a
   custom nodes conda package added to **Conda Packages**, or in a `custom_nodes` folder that
   **Extra Model Paths Config** lists. The job fails with the import error when a custom node
@@ -203,7 +210,8 @@ the same machine.
 - Job bundles in `ComfyUI/user/deadline_submissions/` hold your workflows, prompts and file paths.
   On Linux and macOS that folder and each bundle in it can only be opened by the user that runs
   ComfyUI (mode `0700`), and the files the extension writes there can only be read by that user
-  (`0600`), whatever the umask. On Windows, bundles inherit the permissions of the ComfyUI user folder. The
+  (`0600`), whatever the umask. Models staged in a bundle are often links to your files, so
+  their permissions stay as they are, but they can only be reached through the bundle. On Windows, bundles inherit the permissions of the ComfyUI user folder. The
   `deadline_cloud_submitter.json` config file is also `0600`.
 
 **Sharing a server.** `COMFYUI_DEADLINE_ALLOW_REMOTE=1` turns off the local-only check, including
@@ -220,7 +228,7 @@ don't check who's calling.
 - Deadline Cloud monitor login opens on the ComfyUI server's desktop, not in the browser.
 - Each job runs the workflow once. To render variations, such as two seeds, submit a job for
   each.
-- Models and custom nodes aren't attached. The workers have to provide them.
+- Custom nodes aren't attached. The workers have to provide them.
 - The workflow must have at least one Save node, such as **SaveImage**.
 
 ## Development

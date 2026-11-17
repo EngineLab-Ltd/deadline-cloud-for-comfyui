@@ -1,0 +1,14 @@
+{
+  "name": "deadline-cloud-for-comfyui-frontend",
+  "private": true,
+  "description": "TypeScript source of the ComfyUI submitter's panel, compiled into src/deadline/comfyui_submitter/web.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p .",
+    "check": "tsc -p . --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2"
+  }
+}

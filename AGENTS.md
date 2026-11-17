@@ -1,8 +1,7 @@
 # Agent guide
 
-This repository establishes the policies and automation for an AWS Deadline
-Cloud integration with ComfyUI. The Python package under `src/` is a
-placeholder until the product implementation is added.
+This repository contains an AWS Deadline Cloud integration with ComfyUI: the
+submitter extension under `src/` and its policies and automation.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md) before
 preparing changes. Use conventional commit messages and PR titles, and sign
@@ -24,13 +23,17 @@ Declare GitHub Actions permissions explicitly. Third-party actions use full
 commit SHA pins. Shared AWS Deadline Cloud workflows use
 organization-maintained references.
 
+The panel's source is the TypeScript in `frontend/`. `npm run build` compiles
+it into `src/deadline/comfyui_submitter/web/`. Don't edit or commit the
+compiled JavaScript.
+
 Validate edited YAML and JSON. Use actionlint and the shared zizmor policy for
 workflow changes.
 
 The Python project uses Hatch. Run `hatch run lint` and `hatch run test`
 before submitting changes. The shared workflow runs `hatch -v run lint`,
 `hatch -v build`, and `hatch run test` across Linux, Windows, and macOS with
-Python 3.10–3.13. CodeQL analyzes the Python source under `src/`.
+Python 3.13 and 3.14. CodeQL analyzes the Python source under `src/`.
 
 Product CI requires a root `pyproject.toml` with `project.name` and
 `build-system.build-backend`, Python source under `src/`, tests under `test/`

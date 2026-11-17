@@ -58,7 +58,7 @@ def _run_scenario(tmp_path: Path, ui_source: str, scenario: str) -> dict:
         " parameterControl as __parameterControl, RENDERERS as __renderers,"
         " pollJobs as __pollJobs, formFromRequirements as __formFromRequirements,"
         " requirementsFromForm as __requirementsFromForm,"
-        " createView as __createView,"
+        " createView as __createView, itemEditBase as __itemEditBase,"
         " answerConfirmation as __answerConfirmation, cancelSubmission as __cancelSubmission };\n"
     )
     (web / "deadline_ui.js").write_text(ui_source + exports, encoding="utf-8")
@@ -289,3 +289,31 @@ def test_a_finished_download_says_where_the_files_are(run_scenario, scenario, de
 def test_bool_parameters_are_read_as_openjd_reads_them(run_scenario):
     """So the Attach Custom Nodes checkbox and the attachments agree with what the job does."""
     assert run_scenario("parse-bool")["values"] == [True] * 6 + [False] * 6 + [None] * 5
+
+
+def test_task_lists_count_tasks_and_send_their_ranges(run_scenario):
+    result = run_scenario("task-lists")
+    # OpenJD ranges, as the job's task parameters take them. "0" runs a list whole, as one item.
+    assert result["counts"] == [4, 10, 3, None, None, 1, None]
+    # Every combination: 3 list items × 5 images.
+    assert result["tasks"] == 15
+    # Previews follow the order the tasks run in.
+    assert result["previews"] == ["b.png, c.png, d.png, …", "", "", "a.png, c.png"]
+    # A 3-item list: numbers past the end, below 1, or 0, can't be submitted.
+    assert result["listCounts"] == [3, 2, None, None, None, None, 2, None]
+    assert result["openjdCounts"] == [None, None, None, None, None, 2, 4]
+    assert result["splitByDefault"] is False
+    assert result["splitRequest"] is True
+    # One task: no list parameters, and the edited ranges come back when splitting again.
+    assert result["wholeTasks"] == 1
+    assert result["wholeParameters"] == {}
+    assert result["wholeRequest"] is False
+    assert result["splitAgain"] == 6
+    assert result["editKept"] == "2"
+    assert result["editAfterChange"] is None
+    assert result["splitWhileLoading"] is False
+    assert result["splitAfterSwitch"] is True
+    assert result["splitOtherWorkflow"] is False
+    assert result["canSubmitBadRange"] is False
+    assert result["canSubmit"] is True
+    assert result["parameters"] == {"List1Items": "1-3", "Folder2Items": "1-2"}

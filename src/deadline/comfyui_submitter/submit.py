@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import sys
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -370,6 +371,24 @@ def _workflow_nodes(value: Any):
     if isinstance(definitions, dict):
         for subgraph in definitions.get("subgraphs") or []:
             yield from _workflow_nodes(subgraph)
+
+
+def local_node_packs(
+    api_workflow: dict[str, Any], loaded_dirs: Mapping[str, Path]
+) -> dict[str, Path]:
+    """
+    The custom node packs to attach, by folder or file name. loaded_dirs maps each node type that
+    this ComfyUI loaded from a custom_nodes folder to its pack folder, or single .py file, so
+    ComfyUI's own nodes aren't in it. Workers get every pack the workflow uses through job
+    attachments. Each path is listed once, however many of its nodes are used.
+    """
+    packs: dict[str, Path] = {}
+    for node in api_workflow.values():
+        class_type = node.get("class_type") if isinstance(node, dict) else None
+        path = loaded_dirs.get(class_type) if isinstance(class_type, str) else None
+        if path is not None:
+            packs.setdefault(path.name, path)
+    return dict(sorted(packs.items()))
 
 
 def template_defines_parameter(template: Path, name: str) -> bool:

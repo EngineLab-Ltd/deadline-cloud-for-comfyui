@@ -3,7 +3,8 @@
 Finds the local files an API-format ComfyUI workflow reads (input images, videos, audio and so on,
 but not custom nodes) and writes them to a job bundle's asset_references.yaml. Model files are
 not part of that scan. A model the workflow loads is staged into the job's model directory and
-attached from there.
+attached from there. A custom node pack the workflow uses is staged into the job's custom nodes
+directory in the same way.
 """
 
 from __future__ import annotations
@@ -200,6 +201,80 @@ def stage_local_models(
             logger.exception("Couldn't stage model %r from %s", name, source)
             continue
         staged[key] = target
+    return dict(sorted(staged.items()))
+
+
+# Left out of staged node packs: version control, caches and Python virtual environments.
+_SKIPPED_NODE_DIRS = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        "node_modules",
+    }
+)
+
+
+def _ignore_node_files(directory: str, names: list[str]) -> set[str]:
+    return {
+        name
+        for name in names
+        if name in _SKIPPED_NODE_DIRS
+        or name.endswith(".pyc")
+        or (Path(directory, name) / "pyvenv.cfg").is_file()
+    }
+
+
+def _link_or_copy(source: str, target: str) -> str:
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copy2(source, target)
+    return target
+
+
+def stage_local_node_packs(packs: Mapping[str, Path], dest: Path) -> dict[str, Path]:
+    """
+    Places each custom node pack at dest/<name>: a pack folder is linked file by file, a
+    single-file custom node as one file. Files are hard linked when the destination is on the
+    same volume, and copied otherwise. Version control, cache and virtual environment folders
+    are left out of folders. A pack that cannot be placed is logged and left out.
+    """
+    staged: dict[str, Path] = {}
+    for name, source in packs.items():
+        if not name or name != source.name or PurePath(name).name != name or name in (".", ".."):
+            logger.warning("Not staging custom node pack %r from %s", name, source)
+            continue
+        target = dest / name
+        try:
+            if source.is_dir():
+                shutil.copytree(
+                    source,
+                    target,
+                    ignore=_ignore_node_files,
+                    copy_function=_link_or_copy,
+                    ignore_dangling_symlinks=True,
+                    dirs_exist_ok=True,
+                )
+            elif source.is_file() and source.suffix == ".py":
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not target.exists():
+                    _link_or_copy(str(source), str(target))
+            else:
+                logger.warning("Not staging custom node pack %r from %s", name, source)
+                continue
+        except (OSError, shutil.Error):
+            logger.exception("Couldn't stage custom node pack %r from %s", name, source)
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+            else:
+                target.unlink(missing_ok=True)
+            continue
+        staged[name] = target
     return dict(sorted(staged.items()))
 
 

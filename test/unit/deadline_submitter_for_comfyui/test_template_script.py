@@ -108,7 +108,12 @@ def comfy_calls(tmp_path: Path) -> list[list[str]]:
 
 
 def enter_script(
-    tmp_path: Path, end: str, model_directory: Path | None = None, extra: str = ""
+    tmp_path: Path,
+    end: str,
+    model_directory: Path | None = None,
+    extra: str = "",
+    custom_nodes_directory: Path | None = None,
+    attach_nodes: bool = True,
 ) -> str:
     """The start of the server environment's Enter script, with the job's values filled in."""
     [environment] = TEMPLATE["jobEnvironments"]
@@ -119,17 +124,29 @@ def enter_script(
         .replace("{{Session.WorkingDirectory}}", str(tmp_path))
         .replace("{{Param.ModelDirectory}}", str(model_directory or ""))
         .replace("{{Param.ExtraModelPathsConfig}}", extra)
+        .replace("{{Param.CustomNodesDirectory}}", str(custom_nodes_directory or ""))
+        .replace("{{Param.AttachCustomNodes}}", "true" if attach_nodes else "false")
     )
 
 
 def write_model_paths(
-    tmp_path: Path, model_directory: Path | None = None, conda_nodes: Path | None = None
+    tmp_path: Path,
+    model_directory: Path | None = None,
+    conda_nodes: Path | None = None,
+    custom_nodes_directory: Path | None = None,
+    attach_nodes: bool = True,
 ) -> Any:
     """
     Runs the part of the Enter script that writes extra_model_paths.yaml, and returns the config
     it wrote.
     """
-    script = enter_script(tmp_path, "# ComfyUI can't read an empty", model_directory)
+    script = enter_script(
+        tmp_path,
+        "# ComfyUI can't read an empty",
+        model_directory,
+        custom_nodes_directory=custom_nodes_directory,
+        attach_nodes=attach_nodes,
+    )
     result = subprocess.run(
         ["bash", "-c", "set -euo pipefail\n" + script],
         env={
@@ -172,6 +189,21 @@ def test_model_paths_add_the_conda_environments_custom_nodes(tmp_path):
     assert write_model_paths(tmp_path, conda_nodes=conda_nodes) == {
         "conda_custom_nodes": {"custom_nodes": str(conda_nodes)}
     }
+
+
+def test_model_paths_add_the_attached_custom_nodes(tmp_path):
+    attached = tmp_path / "attached nodes"
+    (attached / "studio-nodes").mkdir(parents=True)
+    assert write_model_paths(tmp_path, custom_nodes_directory=attached) == {
+        "attached_custom_nodes": {"custom_nodes": str(attached)}
+    }
+
+
+def test_model_paths_leave_out_attached_custom_nodes_when_attaching_is_off(tmp_path):
+    """The workers then provide every custom node, for example from a conda package."""
+    attached = tmp_path / "attached nodes"
+    (attached / "studio-nodes").mkdir(parents=True)
+    assert write_model_paths(tmp_path, custom_nodes_directory=attached, attach_nodes=False) is None
 
 
 def model_path_args(

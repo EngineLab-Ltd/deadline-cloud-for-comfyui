@@ -2,8 +2,10 @@ specificationVersion: 'jobtemplate-2023-09'
 name: ComfyUI Workflow (comfy-cli)
 description: >
   Runs a ComfyUI workflow headlessly with comfy-cli. A job environment starts ComfyUI once
-  per session with comfy launch, loading the models attached to the job, and the task runs
-  the workflow with comfy run.
+  per session with comfy launch, loading the models and custom nodes attached to the job,
+  and the task runs the workflow with comfy run.
+# Attach Custom Nodes is a BOOL parameter, which needs EXPR.
+extensions: ["EXPR"]
 
 parameterDefinitions:
 
@@ -75,6 +77,28 @@ parameterDefinitions:
     Optional path, on the worker, to an extra_model_paths.yaml file that points
     ComfyUI at more model folders or custom_nodes folders, for example on shared
     storage. ComfyUI also searches the models attached to the job.
+
+# Custom Node Parameters
+- name: AttachCustomNodes
+  type: BOOL
+  userInterface:
+    control: CHECK_BOX
+    label: Attach Custom Nodes
+    groupLabel: Custom Node Parameters
+  default: "true"
+  description: >
+    Load the custom node packs attached under Custom Nodes Directory on the worker, and
+    install their Python dependencies into a session virtual environment layered on the
+    conda environment, which they can't change. Turn off when the workers already provide
+    every custom node and its dependencies, for example from a custom nodes conda package;
+    Custom Nodes Directory is then ignored.
+- name: CustomNodesDirectory
+  type: PATH
+  objectType: DIRECTORY
+  dataFlow: NONE
+  userInterface:
+    control: HIDDEN
+  default: ""
 
 # Advanced Parameters
 - name: ComfyUIArgs
@@ -178,6 +202,23 @@ jobEnvironments:
             model_folders '{{Param.ModelDirectory}}' >> "$MODEL_PATHS"
             echo "Attached model folders: $(ls '{{Param.ModelDirectory}}' | xargs)"
         fi
+        # Path mapping turns CustomNodesDirectory into the folder where the custom node packs were
+        # attached. Skipped when AttachCustomNodes is off: the workers then provide every custom
+        # node themselves, for example from a conda package.
+        ATTACHED_NODES=()
+        if [ '{{Param.AttachCustomNodes}}' = true ] \
+            && [ -n '{{Param.CustomNodesDirectory}}' ] && [ -d '{{Param.CustomNodesDirectory}}' ]; then
+            cat >> "$MODEL_PATHS" <<EOF
+        attached_custom_nodes:
+            custom_nodes: '{{Param.CustomNodesDirectory}}'
+        EOF
+            for NODE_DIR in '{{Param.CustomNodesDirectory}}'/*/; do
+                if [ -d "$NODE_DIR" ]; then
+                    ATTACHED_NODES+=("${NODE_DIR%/}")
+                fi
+            done
+            echo "Attached custom nodes: $(ls '{{Param.CustomNodesDirectory}}' | xargs)"
+        fi
         # ComfyUI can't read an empty extra model paths file, so it's only passed with entries.
         MODEL_PATH_FILES=()
         if [ -s "$MODEL_PATHS" ]; then
@@ -202,6 +243,34 @@ jobEnvironments:
         fi
         echo "Input directory: $INPUT_DIR"
         mkdir -p "$BASE_DIR/custom_nodes" '{{Param.OutputDir}}' "$INPUT_DIR"
+
+        # The attached packs' pip dependencies go into a virtual environment layered on the conda
+        # environment, which comfy launch uses because VIRTUAL_ENV is set, constrained so they
+        # can't change packages such as torch. AttachCustomNodes off skips this: the workers
+        # provide the custom nodes.
+        if [ ${#ATTACHED_NODES[@]} -gt 0 ]; then
+            VENV='{{Session.WorkingDirectory}}/node-venv'
+            python -m venv --system-site-packages "$VENV" \
+                || { echo "openjd_fail: Couldn't create a virtual environment for the custom nodes"; exit 1; }
+            export VIRTUAL_ENV="$VENV" PATH="$VENV/bin:$PATH"
+            # The comfy package records its pip packages at build time, because the conda
+            # environment has no pip of its own. The virtual environment's pip is the fallback.
+            if [ -f "$COMFYUI_LOCATION/pip-freeze.txt" ]; then
+                grep -v ' @ ' "$COMFYUI_LOCATION/pip-freeze.txt" > '{{Session.WorkingDirectory}}/constraints.txt'
+            else
+                "$VENV/bin/python" -m pip freeze | grep -v ' @ ' > '{{Session.WorkingDirectory}}/constraints.txt'
+            fi
+            export PIP_CONSTRAINT='{{Session.WorkingDirectory}}/constraints.txt'
+            for NODE_DIR in "${ATTACHED_NODES[@]}"; do
+                if [ -f "$NODE_DIR/requirements.txt" ]; then
+                    echo "openjd_status: Installing the requirements of $(basename "$NODE_DIR")"
+                    "$VENV/bin/python" -m pip install -r "$NODE_DIR/requirements.txt" \
+                        || { echo "openjd_fail: Couldn't install the requirements of $(basename "$NODE_DIR")"; exit 1; }
+                fi
+            done
+            "$VENV/bin/python" -m pip check \
+                || { echo "openjd_fail: The custom nodes' dependencies conflict"; exit 1; }
+        fi
 
         PORT=$(python -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
         echo "openjd_status: Starting ComfyUI with comfy launch"

@@ -12,6 +12,7 @@ from deadline.comfyui_submitter.get_local_assets import (
     find_workflow_local_models,
     get_local_assets,
     stage_local_models,
+    stage_local_node_packs,
     write_asset_references,
 )
 from deadline.comfyui_submitter.submit import MODEL_EXTENSIONS
@@ -229,6 +230,80 @@ def test_stage_local_models_uses_comfy_folder_layout(comfy, tmp_path):
     assert expected.read_bytes() == source.read_bytes()
     assert expected.stat().st_ino == source.stat().st_ino
     assert not (dest / "checkpoints" / "secret.safetensors").exists()
+
+
+def test_stage_local_node_packs_copies_the_pack_code(comfy, tmp_path):
+    pack = comfy["custom_nodes"] / "studio-nodes"
+    init = touch(pack / "__init__.py")
+    touch(pack / "nodes" / "resize.py")
+    touch(pack / "requirements.txt")
+    for skipped in (
+        ".git/HEAD",
+        "__pycache__/x.pyc",
+        "nodes/old.pyc",
+        ".venv/lib/x.py",
+        "node_modules/pkg/index.js",
+    ):
+        touch(pack / skipped)
+    touch(pack / ".venv" / "pyvenv.cfg")
+    dest = tmp_path / "local_nodes"
+    staged = stage_local_node_packs({"studio-nodes": pack}, dest)
+    assert staged == {"studio-nodes": dest / "studio-nodes"}
+    files = sorted(p.relative_to(dest).as_posix() for p in dest.rglob("*") if p.is_file())
+    assert files == [
+        "studio-nodes/__init__.py",
+        "studio-nodes/nodes/resize.py",
+        "studio-nodes/requirements.txt",
+    ]
+    assert (dest / "studio-nodes" / "__init__.py").stat().st_ino == init.stat().st_ino
+
+
+def test_stage_local_node_packs_links_a_single_file_node(comfy, tmp_path):
+    source = touch(comfy["custom_nodes"] / "single.py")
+    dest = tmp_path / "local_nodes"
+    staged = stage_local_node_packs({"single.py": source}, dest)
+    assert staged == {"single.py": dest / "single.py"}
+    assert (dest / "single.py").stat().st_ino == source.stat().st_ino
+
+
+def test_stage_local_node_packs_refuses_unsafe_names_and_missing_folders(comfy, tmp_path):
+    pack = comfy["custom_nodes"] / "pack"
+    touch(pack / "__init__.py")
+    script = touch(comfy["custom_nodes"] / "single.py")
+    notes = touch(comfy["custom_nodes"] / "notes.txt")
+    dest = tmp_path / "local_nodes"
+    staged = stage_local_node_packs(
+        {
+            "..": pack,
+            "a/b": pack,
+            "": pack,
+            "gone": comfy["custom_nodes"] / "gone",
+            "renamed.py": script,  # The key must be the file's own name.
+            "notes.txt": notes,  # Only .py files are attached.
+        },
+        dest,
+    )
+    assert staged == {}
+    assert not dest.exists()
+
+
+def test_stage_local_node_packs_skips_a_pack_that_cannot_be_copied(comfy, tmp_path, monkeypatch):
+    kept = comfy["custom_nodes"] / "kept"
+    touch(kept / "__init__.py")
+    dropped = comfy["custom_nodes"] / "dropped"
+    touch(dropped / "__init__.py")
+    copy_tree = shutil.copytree
+
+    def fail_copy(source, target, **kwargs):
+        if Path(source).name == "dropped":
+            raise OSError("disk full")
+        return copy_tree(source, target, **kwargs)
+
+    monkeypatch.setattr("deadline.comfyui_submitter.get_local_assets.shutil.copytree", fail_copy)
+    dest = tmp_path / "local_nodes"
+    staged = stage_local_node_packs({"kept": kept, "dropped": dropped}, dest)
+    assert staged == {"kept": dest / "kept"}
+    assert not (dest / "dropped").exists()
 
 
 def test_find_workflow_local_models_reads_extensions_under_nodes(tmp_path):

@@ -83,7 +83,9 @@ interface Plan {
   // id is the model's folder and name, such as checkpoints/sd.safetensors. Two models can share a
   // name in different folders.
   localModels?: { id: string; name: string; directory: string | null; path: string }[];
+  localNodes?: { name: string; path: string }[];
   warnings?: string[];
+  nodeWarnings?: string[];
 }
 
 interface Submission {
@@ -172,6 +174,7 @@ const TOOLTIP_GAP = 6;
 const TOOLTIP_MARGIN = 8;
 // The submitter fills these in when it creates the job bundle.
 const AUTOMATIC_PARAMETERS = new Set(["WorkflowFile"]);
+const ATTACH_NODES_PARAMETER = "AttachCustomNodes";
 const DEFAULT_SETTINGS: Settings = {
   requirePathsExist: false,
   priority: 50,
@@ -575,6 +578,12 @@ function parameterValue(parameter: Parameter): ParameterValue {
   }
   const filled = state.plan?.values?.[parameter.name];
   return filled ?? parameter.default ?? "";
+}
+
+// Templates without the switch don't list any custom nodes.
+function attachesNodes() {
+  const parameter = state.plan?.parameters.find(({ name }) => name === ATTACH_NODES_PARAMETER);
+  return !parameter || String(parameterValue(parameter)).toLowerCase() !== "false";
 }
 
 // What a queue parameter is without the artist's edit: the submitter's configured value, then the
@@ -1163,8 +1172,12 @@ function renderStatus() {
         h("span", { className: "dl-muted" }, ` · ${plan.template}`)
       )
     );
+    // With Attach Custom Nodes off, the workers provide the custom nodes.
+    const ignored = attachesNodes() ? [] : plan.nodeWarnings ?? [];
     for (const warning of plan.warnings ?? []) {
-      children.push(h("div", { className: "dl-notice dl-warn-box" }, warning));
+      if (!ignored.includes(warning)) {
+        children.push(h("div", { className: "dl-notice dl-warn-box" }, warning));
+      }
     }
     const excluded = excludedModels();
     if (excluded.length) {
@@ -1254,6 +1267,9 @@ function renderParameters() {
           parameter.userInterface?.label || parameter.name,
           parameterControl(parameter, parameterValue(parameter), (value: string) => {
             state.edits[parameter.name] = value;
+            if (parameter.name === ATTACH_NODES_PARAMETER) {
+              refresh("status", "attachments");
+            }
           }),
           parameter.description
         )
@@ -1822,10 +1838,12 @@ function renderAttachments() {
     }
   }
   const localModels = state.plan.localModels ?? [];
+  const localNodes = attachesNodes() ? state.plan.localNodes ?? [] : [];
   const attachedCount =
     [...rows.keys()].filter((path) => !state.removedAttachments.has(path)).length +
     localModels.length -
-    excludedModels().length;
+    excludedModels().length +
+    localNodes.length;
   const remove = (row: Row) => () => {
     if (row.manual) {
       added[row.key] = added[row.key].filter((path) => path !== row.path);
@@ -1886,6 +1904,18 @@ function renderAttachments() {
                 toggleModel(model, true),
                 toggleModel(model, false)
               )
+            )
+          ),
+        ]
+      : null,
+    localNodes.length
+      ? [
+          h("div", { className: "dl-label" }, "Custom nodes the workflow uses, attached automatically"),
+          h(
+            "ul",
+            { className: "dl-files" },
+            localNodes.map((pack) =>
+              h("li", { title: pack.path }, h("span", { className: "dl-path" }, pack.name))
             )
           ),
         ]

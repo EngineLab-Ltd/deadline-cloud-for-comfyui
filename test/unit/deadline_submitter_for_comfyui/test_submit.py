@@ -21,6 +21,7 @@ from deadline.comfyui_submitter.submit import (
     check_cli_version,
     create_job_bundle,
     get_safe_path,
+    local_node_packs,
     parse_cli_version,
     resolve_deadline_cli,
     resolve_job_template,
@@ -246,6 +247,32 @@ def test_workflow_models():
     ]
 
 
+KJ_API = {
+    "1": {"class_type": "KSampler", "inputs": {}},
+    "2": {"class_type": "ImageResizeKJv2", "inputs": {}},
+    "3": {"class_type": "VHS_VideoCombine", "inputs": {}},
+}
+
+
+def test_local_node_packs_attaches_every_custom_pack_the_workflow_uses(tmp_path):
+    """Workers get custom nodes only through job attachments, registry installs included."""
+    kj, vhs, unused = (tmp_path / name for name in ("comfyui-kjnodes", "vhs", "unused"))
+    # ComfyUI's own nodes, such as KSampler, aren't loaded from custom_nodes, so aren't listed.
+    loaded = {"ImageResizeKJv2": kj, "VHS_VideoCombine": vhs, "Unused": unused}
+    assert local_node_packs(KJ_API, loaded) == {"comfyui-kjnodes": kj, "vhs": vhs}
+
+
+def test_local_node_packs_lists_each_folder_once(tmp_path):
+    pack = tmp_path / "studio-nodes"
+    loaded = {"ImageResizeKJv2": pack, "VHS_VideoCombine": pack}
+    assert local_node_packs(KJ_API, loaded) == {"studio-nodes": pack}
+
+
+def test_local_node_packs_includes_single_file_nodes(tmp_path):
+    script = tmp_path / "custom_nodes" / "single.py"
+    assert local_node_packs(KJ_API, {"ImageResizeKJv2": script}) == {"single.py": script}
+
+
 @pytest.mark.parametrize(
     ("content", "expected"),
     [
@@ -419,13 +446,14 @@ def test_create_job_bundle_description_is_valid_at_the_limit(tmp_path):
     )
     template = yaml.safe_load((bundle_dir / "template.yaml").read_text())
     assert template["description"] == description
-    decode_job_template(template=template)
+    decode_job_template(template=template, supported_extensions=["EXPR"])
 
 
 def _tasks(bundle_dir: Path, tmp_path: Path, **values: str) -> list[dict[str, str]]:
     """Creates the bundle's job with openjd-model, as Deadline Cloud does, and lists its tasks."""
     template = decode_job_template(
         template=yaml.safe_load((bundle_dir / "template.yaml").read_text()),
+        supported_extensions=["EXPR"],
     )
     parameters = preprocess_job_parameters(
         job_template=template,

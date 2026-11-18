@@ -110,6 +110,8 @@ interface JobStatus {
   lifecycleStatus?: string;
   taskRunStatusCounts?: Record<string, number>;
   error?: string;
+  // The job doesn't exist, or these credentials can't see it, so it isn't polled again.
+  notFound?: boolean;
 }
 
 // The deadline.* events the routes send over ComfyUI's websocket.
@@ -376,6 +378,8 @@ export function loadAccount(force = false) {
     }
     refresh();
     if (state.account?.authenticationStatus === "AUTHENTICATED") {
+      // Recent jobs waits for the account, so poll now rather than at the next timer.
+      pollJobs();
       await loadFarms();
     }
   })();
@@ -858,10 +862,11 @@ async function pollJobs() {
 
 async function pollOnce() {
   clearTimeout(pollTimer);
-  // A job whose status can't be read, such as a deleted one, isn't asked about again.
+  // A deleted job, or one these credentials can't see, isn't asked about again. Other errors,
+  // such as throttling or expired credentials, are tried again next time.
   const pending = state.jobs.filter((job) => {
     const status = state.jobStatus[job.jobId];
-    return !status?.error && !DONE_STATUSES.has(status?.taskRunStatus ?? "");
+    return !status?.notFound && !DONE_STATUSES.has(status?.taskRunStatus ?? "");
   });
   const byQueue = new Map<string, Job[]>();
   for (const job of pending) {
@@ -877,6 +882,11 @@ async function pollOnce() {
           jobIds: jobs.map((job) => job.jobId),
         });
         for (const job of result.jobs) {
+          // A passing error keeps the last status the job had, and its Download button.
+          const previous = state.jobStatus[job.jobId];
+          if (job.error && !job.notFound && previous && !previous.error) {
+            continue;
+          }
           state.jobStatus[job.jobId] = job;
         }
       } catch {

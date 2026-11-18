@@ -149,6 +149,11 @@ def set_defaults(request: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+# Errors that mean the job is gone, or that these credentials can't see it, rather than a failure
+# worth trying again, such as throttling or expired credentials.
+JOB_GONE_ERRORS = {"ResourceNotFoundException", "AccessDeniedException"}
+
+
 def jobs(request: dict[str, Any]) -> dict[str, Any]:
     from deadline.client import api
 
@@ -160,7 +165,12 @@ def jobs(request: dict[str, Any]) -> dict[str, Any]:
                 farmId=request["farmId"], queueId=request["queueId"], jobId=job_id, config=config
             )
         except Exception as e:  # noqa: BLE001 - one missing job mustn't hide the others.
-            found.append({"jobId": job_id, "error": str(e)})
+            response = getattr(e, "response", None)
+            code = response.get("Error", {}).get("Code") if isinstance(response, dict) else None
+            status: dict[str, Any] = {"jobId": job_id, "error": str(e)}
+            if code in JOB_GONE_ERRORS:
+                status["notFound"] = True
+            found.append(status)
             continue
         found.append(
             {

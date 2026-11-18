@@ -168,17 +168,22 @@ if (scenario === "edited-before-replanning") {
   let running = 0;
   result.mostAtOnce = 0;
   const answer = deferred();
+  let calls = 0;
   api.handlers["/deadline/cloud/jobs"] = async (body) => {
+    calls += 1;
     running += 1;
     result.mostAtOnce = Math.max(result.mostAtOnce, running);
     if (scenario === "poll-overlapping") {
       await answer.promise;
     }
     running -= 1;
+    const runningJob = { jobId: "job-1", taskRunStatus: "RUNNING", taskRunStatusCounts: { SUCCEEDED: 1 } };
     const status =
       scenario === "poll-error"
-        ? { jobId: "job-1", error: "Not found" }
-        : { jobId: "job-1", taskRunStatus: "RUNNING" };
+        ? { jobId: "job-1", error: "Not found", notFound: true }
+        : scenario === "poll-transient" && calls === 2
+          ? { jobId: "job-1", error: "Rate exceeded" }
+          : runningJob;
     return { jobs: [status] };
   };
   if (scenario === "poll-overlapping") {
@@ -189,6 +194,16 @@ if (scenario === "edited-before-replanning") {
     await settle();
     answer.resolve();
     await Promise.all([first, second, third]);
+  } else if (scenario === "poll-transient") {
+    // The second poll fails for a moment, such as when throttled.
+    await ui.__pollJobs();
+    await ui.__pollJobs();
+    result.statusAfterError = state.jobStatus["job-1"].taskRunStatus ?? null;
+    await ui.__pollJobs();
+  } else if (scenario === "poll-after-account") {
+    // Opening the panel loads the account, then polls straight away, not at the next timer.
+    await ui.loadAccount(true);
+    await settle();
   } else {
     await ui.__pollJobs();
     await ui.__pollJobs();

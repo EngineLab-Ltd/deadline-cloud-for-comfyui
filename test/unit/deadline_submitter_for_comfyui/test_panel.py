@@ -152,6 +152,17 @@ def test_a_job_whose_status_cant_be_read_isnt_polled_again(run_scenario):
     assert run_scenario("poll-error")["polls"] == 1
 
 
+def test_a_job_whose_status_failed_for_a_moment_keeps_its_status_and_is_polled_again(run_scenario):
+    """Throttling or expired credentials don't take a job out of Recent jobs' polling."""
+    result = run_scenario("poll-transient")
+    assert result["statusAfterError"] == "RUNNING"
+    assert result["polls"] == 3
+
+
+def test_jobs_are_polled_once_the_account_loads(run_scenario):
+    assert run_scenario("poll-after-account")["polls"] == 1
+
+
 def test_a_running_job_is_polled_again(run_scenario):
     assert run_scenario("poll-running")["polls"] == 2
 

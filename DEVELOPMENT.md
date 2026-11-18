@@ -25,7 +25,7 @@ npm ci
 | `src/deadline/comfyui_submitter/bridge.py` | Calls `deadline.client.api` for the routes. It runs in the Deadline Cloud CLI's Python (`python -I bridge.py <command>`) and speaks JSON lines, so it only imports the standard library and `deadline`. |
 | `frontend/src/extensions/deadline-cloud/` | The frontend extension's TypeScript. `deadline_submit.ts` registers the commands, the action bar button and the sidebar tab; `deadline_ui.ts` is the panel and the dialog, in plain DOM with ComfyUI's theme variables. The folder mirrors where ComfyUI serves the extension, so imports such as `../../scripts/app.js` resolve to the type declarations in `frontend/src/scripts/`. |
 | `src/deadline/comfyui_submitter/web/` | The compiled JavaScript that ComfyUI serves. It's built by `npm run build` in `frontend/`, which `install_submitter.py` runs, and isn't committed. |
-| `src/deadline/comfyui_submitter/comfy_cli_job_template.yaml` | The job template. Each submission copies it into a new job bundle under `ComfyUI/user/deadline_submissions/`, with the workflow and the list of input files it attaches. |
+| `src/deadline/comfyui_submitter/comfy_cli_job_template.yaml` | The job template. Each submission copies it into a new job bundle under `ComfyUI/user/deadline_submissions/`, with the workflow, the models it attaches and the list of input files. |
 | `test/unit/` | Unit tests. |
 
 ## Commands
@@ -63,11 +63,12 @@ a running ComfyUI, so test them by hand:
    ```
 3. Check the server log for errors that start with `Deadline Cloud Submitter:`. Then open
    ComfyUI, open the **Deadline** sidebar tab, and check that it shows your login status, your
-   default farm and queue, and, under **Attachments**, the input files the workflow loads.
-4. Submit an image-to-image workflow from the **Deadline** button's dialog, with **Extra Model
-   Paths Config** pointing at a config on the workers that lists their model folders. Check the
-   upload progress and the job ID notification. When the job finishes, run
-   `deadline job download-output` and check that it returns the image.
+   default farm and queue, and, under **Attachments**, the models and input files the workflow
+   loads.
+4. Submit an image-to-image workflow from the **Deadline** button's dialog, with its model on
+   this machine and **Extra Model Paths Config** empty. Check the upload progress and the job ID
+   notification. When the job finishes, run `deadline job download-output` and check that it
+   returns the image.
 
 To exercise the routes without the frontend:
 

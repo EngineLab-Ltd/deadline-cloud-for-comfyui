@@ -26,6 +26,8 @@ DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[3] / CONFIG_FILE_NAME
 
 JOB_TEMPLATE = Path(__file__).parent / "comfy_cli_job_template.yaml"
 DEFAULT_WORKFLOW_NAME = "ComfyUI workflow"
+# ComfyUI's supported_pt_extensions, plus .gguf for the GGUF loader nodes.
+MODEL_EXTENSIONS = (".ckpt", ".pt", ".pt2", ".bin", ".pth", ".safetensors", ".pkl", ".sft", ".gguf")
 
 # The oldest CLI the submitter supports. Older libraries don't read BOOL job parameters.
 MIN_CLI_VERSION = (0, 60, 8)
@@ -342,6 +344,21 @@ def _dump_template(job_template: dict[str, Any]) -> str:
     return yaml.dump(job_template, Dumper=TemplateDumper, sort_keys=False, width=100)
 
 
+def workflow_models(api_workflow: dict[str, Any]) -> list[str]:
+    """
+    Lists the model files the workflow loads: every string input that names a model file. The
+    submitter attaches a local copy when this machine has the file. Otherwise the job fails unless
+    the workers already have it, for example through Extra Model Paths Config.
+    """
+    models = {
+        value.replace("\\", "/")
+        for node in api_workflow.values()
+        for value in node.get("inputs", {}).values()
+        if isinstance(value, str) and value.lower().endswith(MODEL_EXTENSIONS)
+    }
+    return sorted(models)
+
+
 def _workflow_nodes(value: Any):
     """Yields every node of a UI-format workflow, including the nodes inside subgraphs."""
     if not isinstance(value, dict):
@@ -353,6 +370,17 @@ def _workflow_nodes(value: Any):
     if isinstance(definitions, dict):
         for subgraph in definitions.get("subgraphs") or []:
             yield from _workflow_nodes(subgraph)
+
+
+def template_defines_parameter(template: Path, name: str) -> bool:
+    """Whether a YAML or JSON job template defines the job parameter `name`."""
+    pattern = (
+        rf"""^\s*(-\s*)?name:\s*['"]?{re.escape(name)}['"]?\s*$|"name"\s*:\s*"{re.escape(name)}\""""
+    )
+    try:
+        return re.search(pattern, template.read_text(encoding="utf-8"), re.MULTILINE) is not None
+    except OSError:
+        return False
 
 
 def safe_name(name: str) -> str:
@@ -437,8 +465,8 @@ def create_job_bundle(
         bundle_dir = get_safe_path(leaf, dest_dir)
     except ValueError as e:
         raise SubmitError(str(e)) from e
-    # Everything in the bundle is only reachable through these directories, whatever its own
-    # permissions.
+    # Everything in the bundle, such as linked models, is only reachable through these
+    # directories, whatever its own permissions.
     make_private_dir(dest_dir)
     bundle_dir.mkdir(mode=PRIVATE_DIR_MODE)
     os.chmod(bundle_dir, PRIVATE_DIR_MODE)

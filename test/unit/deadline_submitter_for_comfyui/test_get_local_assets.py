@@ -1,4 +1,5 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+import shutil
 from pathlib import Path
 
 import pytest
@@ -6,9 +7,14 @@ import yaml
 
 from deadline.comfyui_submitter.get_local_assets import (
     LocalAssets,
+    _search_local_models,
+    find_local_model,
+    find_workflow_local_models,
     get_local_assets,
+    stage_local_models,
     write_asset_references,
 )
+from deadline.comfyui_submitter.submit import MODEL_EXTENSIONS
 
 
 @pytest.fixture
@@ -136,4 +142,319 @@ def test_asset_references_yaml_format(tmp_path):
             "outputs": {"directories": []},
             "referencedPaths": [],
         }
+    }
+
+
+def test_find_local_model_searches_registered_directories(comfy, tmp_path):
+    extra = tmp_path / "extra" / "vae"
+    expected = touch(extra / "nested" / "ae.safetensors")
+    touch(comfy["checkpoints"] / "ae.safetensors")
+    folders = {
+        "vae": ([str(comfy["checkpoints"]), str(extra)], {".safetensors"}),
+    }
+    assert find_local_model(folders, "vae", "nested/ae.safetensors") == expected
+    assert find_local_model(folders, "vae", "../secret.safetensors") is None
+    assert find_local_model(folders, "loras", "ae.safetensors") is None
+
+
+def test_find_workflow_local_models_skips_missing_files(comfy, caplog):
+    path = touch(comfy["checkpoints"] / "custom.safetensors")
+    folders = {"checkpoints": ([str(comfy["checkpoints"])], {".safetensors"})}
+    ui = {
+        "nodes": [
+            {
+                "properties": {
+                    "models": [
+                        {"directory": "checkpoints", "name": "custom.safetensors"},
+                        {"directory": "checkpoints", "name": "gone.safetensors"},
+                    ]
+                }
+            }
+        ]
+    }
+    api = {
+        "1": {
+            "inputs": {"ckpt_name": "custom.safetensors", "lora_name": "gone.safetensors"},
+        }
+    }
+    found, directories = find_workflow_local_models(ui, api, folders)
+    assert found == {"checkpoints/custom.safetensors": path}
+    assert directories == {"checkpoints/custom.safetensors": "checkpoints"}
+    assert "gone.safetensors" in caplog.text
+
+
+def test_stage_local_models_skips_a_file_that_cannot_be_placed(comfy, tmp_path, monkeypatch):
+    kept = touch(comfy["checkpoints"] / "kept.safetensors")
+    dropped = touch(comfy["loras"] / "dropped.safetensors")
+
+    copy_file = shutil.copy2
+
+    def fail_link(source, target):
+        raise OSError("link")
+
+    def fail_copy(source, target):
+        if Path(source).name == "dropped.safetensors":
+            raise OSError("disk full")
+        copy_file(source, target)
+
+    monkeypatch.setattr("deadline.comfyui_submitter.get_local_assets.os.link", fail_link)
+    monkeypatch.setattr("deadline.comfyui_submitter.get_local_assets.shutil.copy2", fail_copy)
+    dest = tmp_path / "local_models"
+    staged = stage_local_models(
+        {"checkpoints/kept.safetensors": kept, "loras/dropped.safetensors": dropped},
+        {"checkpoints/kept.safetensors": "checkpoints", "loras/dropped.safetensors": "loras"},
+        dest,
+    )
+    assert staged == {"checkpoints/kept.safetensors": dest / "checkpoints" / "kept.safetensors"}
+    assert not (dest / "loras" / "dropped.safetensors").exists()
+
+
+def test_stage_local_models_uses_comfy_folder_layout(comfy, tmp_path):
+    source = touch(comfy["checkpoints"] / "nested" / "custom.safetensors")
+    secret = touch(tmp_path / "secret.safetensors")
+    dest = tmp_path / "local_models"
+    staged = stage_local_models(
+        {
+            "checkpoints/nested/custom.safetensors": source,
+            "checkpoints/../../secret.safetensors": secret,
+        },
+        {
+            "checkpoints/nested/custom.safetensors": "checkpoints",
+            "checkpoints/../../secret.safetensors": "checkpoints",
+        },
+        dest,
+    )
+    expected = dest / "checkpoints" / "nested" / "custom.safetensors"
+    assert staged == {"checkpoints/nested/custom.safetensors": expected}
+    assert expected.read_bytes() == source.read_bytes()
+    assert expected.stat().st_ino == source.stat().st_ino
+    assert not (dest / "checkpoints" / "secret.safetensors").exists()
+
+
+def test_find_workflow_local_models_reads_extensions_under_nodes(tmp_path):
+    checkpoints = tmp_path / "checkpoints"
+    folders = {"checkpoints": ([str(checkpoints)], set[str]())}
+    names = [f"m{extension}" for extension in MODEL_EXTENSIONS]
+    for name in names:
+        touch(checkpoints / name)
+    touch(checkpoints / "photo.png")
+    ui = {
+        "nodes": [
+            {
+                "type": "CheckpointLoaderSimple",
+                "properties": {
+                    "models": [{"directory": "checkpoints", "name": name} for name in names]
+                },
+                "widgets_values": [*names, "photo.png"],
+            }
+        ]
+    }
+    api = {"1": {"inputs": {name: name for name in [*names, "photo.png"]}}}
+    found, directories = find_workflow_local_models(ui, api, folders)
+    assert found == {f"checkpoints/{name}": checkpoints / name for name in names}
+    assert directories == {f"checkpoints/{name}": "checkpoints" for name in names}
+
+
+def test_find_workflow_local_models_reads_properties_on_a_node_inside_a_subgraph(tmp_path):
+    """A subgraph node's properties name the folder. A URL there doesn't stop it being staged."""
+    checkpoint = touch(tmp_path / "checkpoints" / "sd.safetensors")
+    kept = touch(tmp_path / "loras" / "style.safetensors")
+    folders = {
+        "checkpoints": ([str(checkpoint.parent)], {".safetensors"}),
+        "loras": ([str(kept.parent)], {".safetensors"}),
+    }
+    ui = {
+        "nodes": [
+            {
+                "type": "sg",
+                "properties": {"cnr_id": "comfy-core", "ver": "0.3.64"},
+                "inputs": [
+                    {"name": "ckpt_name", "widget": {"name": "ckpt_name"}},
+                    {"name": "lora_name", "widget": {"name": "lora_name"}},
+                ],
+                "widgets_values_named": {
+                    "ckpt_name": "sd.safetensors",
+                    "lora_name": "style.safetensors",
+                },
+            }
+        ],
+        "definitions": {
+            "subgraphs": [
+                {
+                    "id": "sg",
+                    "inputs": [
+                        {"name": "ckpt_name", "linkIds": [1]},
+                        {"name": "lora_name", "linkIds": [2]},
+                    ],
+                    "nodes": [
+                        {
+                            "type": "CheckpointLoaderSimple",
+                            "inputs": [
+                                {
+                                    "name": "ckpt_name",
+                                    "widget": {"name": "ckpt_name"},
+                                    "link": 1,
+                                }
+                            ],
+                            "properties": {
+                                "models": [
+                                    {
+                                        "directory": "checkpoints",
+                                        "name": "sd.safetensors",
+                                        "url": "https://x.test/sd.safetensors",
+                                    }
+                                ]
+                            },
+                        },
+                        {
+                            "type": "LoraLoader",
+                            "inputs": [
+                                {"name": "lora_name", "widget": {"name": "lora_name"}, "link": 2}
+                            ],
+                            "properties": {
+                                "models": [{"directory": "loras", "name": "style.safetensors"}]
+                            },
+                        },
+                    ],
+                }
+            ]
+        },
+    }
+    api = {
+        "1": {"inputs": {"ckpt_name": "sd.safetensors"}},
+        "2": {"inputs": {"lora_name": "style.safetensors"}},
+    }
+    found, directories = find_workflow_local_models(ui, api, folders)
+    assert found == {"checkpoints/sd.safetensors": checkpoint, "loras/style.safetensors": kept}
+    assert directories == {
+        "checkpoints/sd.safetensors": "checkpoints",
+        "loras/style.safetensors": "loras",
+    }
+    dest = tmp_path / "local_models"
+    staged = stage_local_models(found, directories, dest)
+    assert staged == {
+        "checkpoints/sd.safetensors": dest / "checkpoints" / "sd.safetensors",
+        "loras/style.safetensors": dest / "loras" / "style.safetensors",
+    }
+
+
+def test_find_workflow_local_models_searches_registered_folders_without_a_directory(tmp_path):
+    path = touch(tmp_path / "loras" / "style.pt")
+    other = touch(tmp_path / "checkpoints" / "other.ckpt")
+    folders = {
+        "checkpoints": ([str(tmp_path / "checkpoints")], set[str]()),
+        "loras": ([str(path.parent)], set[str]()),
+    }
+    # other.ckpt is only an API input. models_without_links still counts it, so it is attached.
+    ui = {"nodes": [{"widgets_values": ["style.pt", "notes.txt"]}]}
+    api = {"1": {"inputs": {"lora_name": "style.pt", "ckpt_name": "other.ckpt"}}}
+    found, directories = find_workflow_local_models(ui, api, folders)
+    assert found == {"checkpoints/other.ckpt": other, "loras/style.pt": path}
+    assert directories == {"checkpoints/other.ckpt": "checkpoints", "loras/style.pt": "loras"}
+
+
+@pytest.mark.parametrize(
+    ("hint", "folder"), [("clip", "text_encoders"), ("unet", "diffusion_models")]
+)
+def test_find_workflow_local_models_maps_legacy_folder_names(tmp_path, hint, folder):
+    """ComfyUI loads clip and unet models from text_encoders and diffusion_models."""
+    path = touch(tmp_path / folder / "m.safetensors")
+    folders = {folder: ([str(path.parent)], set[str]())}
+    ui = {"nodes": [{"properties": {"models": [{"directory": hint, "name": "m.safetensors"}]}}]}
+    api = {"1": {"inputs": {"clip_name": "m.safetensors"}}}
+    assert find_workflow_local_models(ui, api, folders) == (
+        {f"{folder}/m.safetensors": path},
+        {f"{folder}/m.safetensors": folder},
+    )
+
+
+def test_find_workflow_local_models_trusts_the_folder_a_loader_declares(tmp_path, caplog):
+    """The worker's loader only reads its folder, so a file elsewhere wouldn't help it."""
+    touch(tmp_path / "vae" / "m.safetensors")
+    folders = {
+        "checkpoints": ([str(tmp_path / "checkpoints")], set[str]()),
+        "vae": ([str(tmp_path / "vae")], set[str]()),
+    }
+    ui = {
+        "nodes": [
+            {"properties": {"models": [{"directory": "checkpoints", "name": "m.safetensors"}]}}
+        ]
+    }
+    api = {"1": {"inputs": {"ckpt_name": "m.safetensors"}}}
+    assert find_workflow_local_models(ui, api, folders) == ({}, {})
+    assert "m.safetensors" in caplog.text
+
+
+@pytest.mark.parametrize("hint", [("checkpoints", False), ("my_models", True)])
+def test_find_workflow_local_models_searches_every_folder_when_an_unsure_hint_misses(
+    tmp_path, hint
+):
+    """A guess from a subgraph, or a folder ComfyUI doesn't register, doesn't hide a model."""
+    path = touch(tmp_path / "vae" / "m.safetensors")
+    folders = {
+        "checkpoints": ([str(tmp_path / "checkpoints")], set[str]()),
+        "vae": ([str(path.parent)], set[str]()),
+    }
+    assert _search_local_models(folders, "m.safetensors", [hint]) == [(path, "vae")]
+
+
+def test_stage_local_models_warns_when_it_copies_a_model(comfy, tmp_path, monkeypatch, caplog):
+    """A copy, such as of a model on another drive, takes time and space, so it's logged."""
+    source = touch(comfy["checkpoints"] / "m.safetensors")
+
+    def fail_link(source, target):
+        raise OSError("Invalid cross-device link")
+
+    monkeypatch.setattr("deadline.comfyui_submitter.get_local_assets.os.link", fail_link)
+    dest = tmp_path / "local_models"
+    key = "checkpoints/m.safetensors"
+    staged = stage_local_models({key: source}, {key: "checkpoints"}, dest)
+    assert staged == {key: dest / "checkpoints" / "m.safetensors"}
+    assert "Copying model 'm.safetensors' into the job bundle" in caplog.text
+    assert "Invalid cross-device link" in caplog.text
+
+
+def test_models_with_the_same_name_in_different_folders_are_each_attached(tmp_path):
+    """A checkpoint and a LoRA can share a file name. Each loader needs its own."""
+    checkpoint = touch(tmp_path / "checkpoints" / "shared.safetensors")
+    lora = touch(tmp_path / "loras" / "shared.safetensors")
+    folders = {
+        "checkpoints": ([str(checkpoint.parent)], set[str]()),
+        "loras": ([str(lora.parent)], set[str]()),
+        "vae": ([str(tmp_path / "vae")], set[str]()),
+    }
+    api = {
+        "1": {"inputs": {"ckpt_name": "shared.safetensors"}},
+        "2": {"inputs": {"lora_name": "shared.safetensors"}},
+    }
+    expected = (
+        {"checkpoints/shared.safetensors": checkpoint, "loras/shared.safetensors": lora},
+        {"checkpoints/shared.safetensors": "checkpoints", "loras/shared.safetensors": "loras"},
+    )
+    # With the loaders' folders.
+    ui = {
+        "nodes": [
+            {"properties": {"models": [{"directory": folder, "name": "shared.safetensors"}]}}
+            for folder in ("checkpoints", "loras")
+        ]
+    }
+    assert find_workflow_local_models(ui, api, folders) == expected
+    # Without them, every folder with the name.
+    assert find_workflow_local_models({"nodes": []}, api, folders) == expected
+    # With one folder, only that one.
+    ui = {
+        "nodes": [
+            {"properties": {"models": [{"directory": "loras", "name": "shared.safetensors"}]}}
+        ]
+    }
+    assert find_workflow_local_models(ui, api, folders) == (
+        {"loras/shared.safetensors": lora},
+        {"loras/shared.safetensors": "loras"},
+    )
+    # Each is staged in its own folder.
+    dest = tmp_path / "local_models"
+    staged = stage_local_models(*expected, dest)
+    assert staged == {
+        "checkpoints/shared.safetensors": dest / "checkpoints" / "shared.safetensors",
+        "loras/shared.safetensors": dest / "loras" / "shared.safetensors",
     }

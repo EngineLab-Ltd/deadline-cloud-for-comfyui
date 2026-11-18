@@ -13,7 +13,11 @@ import ipaddress
 import json
 import logging
 import re
+import shutil
+import threading
+import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -22,7 +26,14 @@ import folder_paths
 from aiohttp import web
 from server import PromptServer
 
-from .get_local_assets import LocalAssets, get_local_assets, write_asset_references
+from .get_local_assets import (
+    LocalAssets,
+    find_workflow_local_models,
+    get_local_assets,
+    model_name,
+    stage_local_models,
+    write_asset_references,
+)
 from .submit import (
     ALLOW_REMOTE_ENV_VAR,
     DEFAULT_WORKFLOW_NAME,
@@ -40,7 +51,10 @@ from .submit import (
     resolve_conda_channels,
     resolve_deadline_cli,
     resolve_job_template,
+    template_defines_parameter,
     validate_api_workflow,
+    workflow_models,
+    write_private_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,6 +74,11 @@ LOGIN_TIMEOUT = 600
 # A confirmation nobody answers, for example after its tab closed, is declined after this long, so
 # the submission ends instead of waiting forever.
 CONFIRM_TIMEOUT = 600
+# A bundle made for a submission holds this file. The bundle is deleted when its submission is
+# done, or if that didn't happen, such as when ComfyUI stopped, when ComfyUI next starts after a
+# day. Bundles saved to keep don't have it.
+SUBMISSION_MARKER = ".deadline-submission"
+OLD_SUBMISSION_AGE = 24 * 60 * 60
 # The queue environment parameter that the config's conda_channels fills in.
 CONDA_CHANNELS_PARAMETER = "CondaChannels"
 
@@ -80,9 +99,35 @@ class _Submission:
     answered: int = 0
     # Timers that decline unanswered confirmations, canceled when the submission ends.
     timers: list[asyncio.Task] = field(default_factory=list)
+    # The job bundle, deleted once the job is created or the submission is canceled.
+    bundle_dir: Path | None = None
 
 
 _submissions: dict[str, _Submission] = {}
+
+
+@dataclass
+class _Prepared:
+    """What a workflow submits with, before the job bundle exists."""
+
+    workflow: dict[str, Any]
+    # Job parameter values the submitter fills in. WorkflowFile isn't known until the bundle exists.
+    values: dict[str, Any] = field(default_factory=dict)
+    conda_channels: str | None = None
+    warnings: list[str] = field(default_factory=list)
+    # Local files for the models the workflow loads, and the model folder of each, by model ID:
+    # the folder and the name the workflow loads it by.
+    local_models: dict[str, Path] = field(default_factory=dict)
+    model_directories: dict[str, str] = field(default_factory=dict)
+    model_warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _Staged:
+    """What was placed in the job bundle to attach, and the folder the job maps them through."""
+
+    model_dir: Path | None = None
+    filenames: list[Path] = field(default_factory=list)
 
 
 async def _cli_version_output(cli: str) -> str:
@@ -226,15 +271,98 @@ def _workflow_name(body: dict[str, Any]) -> str:
     return name[: -len(".json")] if name.lower().endswith(".json") else name
 
 
-def _filled_values() -> dict[str, Any]:
+def _prepare(
+    body: dict[str, Any], workflow: dict[str, Any], template: Path, config: dict[str, Any]
+) -> _Prepared:
+    """Finds what the workflow needs attached and fills in the parameters. Raises SubmitError."""
+    prepared = _Prepared(workflow=workflow, conda_channels=resolve_conda_channels(config))
+    prepared.values["OutputDir"] = folder_paths.get_output_directory()
+    prepared.values["InputDir"] = folder_paths.get_input_directory()
+    # A template without Model Directory can't map attached models on the worker.
+    if template_defines_parameter(template, "ModelDirectory"):
+        prepared.local_models, prepared.model_directories = _local_model_paths(
+            body.get("ui_workflow"), workflow
+        )
+    prepared.model_warnings = _model_warnings(workflow, prepared.local_models)
+    prepared.warnings.extend(prepared.model_warnings)
+    return prepared
+
+
+def _stage_prepared(prepared: _Prepared, workflow: dict[str, Any], bundle_dir: Path) -> _Staged:
+    """Stages the local models into the bundle, under the folder Deadline Cloud maps on the worker."""
+    model_dir = bundle_dir / "local_models"
+    staged = _stage_local_models(prepared.local_models, prepared.model_directories, model_dir)
+    if set(staged) != set(prepared.local_models):
+        # The plan counted on attaching these, so warn about the ones that couldn't be.
+        prepared.warnings = [w for w in prepared.warnings if w not in prepared.model_warnings]
+        prepared.model_warnings = _model_warnings(workflow, staged)
+        prepared.warnings.extend(prepared.model_warnings)
+    return _Staged(model_dir=model_dir if staged else None, filenames=list(staged.values()))
+
+
+def _stage_local_models(
+    models: dict[str, Path], directories: dict[str, str], model_dir: Path
+) -> dict[str, Path]:
+    """Stages local models into the bundle. A failure still lets the submission go ahead."""
+    if not models:
+        return {}
+    try:
+        return stage_local_models(models, directories, model_dir)
+    except Exception:
+        logger.exception("Couldn't stage local models")
+        return {}
+
+
+def _model_warnings(workflow: dict[str, Any], attached: dict[str, Path]) -> list[str]:
+    """A warning for loaded models that aren't attached. attached is by model ID."""
+    names = {model_name(key) for key in attached}
+    missing = [name for name in workflow_models(workflow) if name not in names]
+    if not missing:
+        return []
+    return [
+        (
+            f"{', '.join(missing)} won't be attached. The job fails unless the workers already "
+            "have it, for example through Extra Model Paths Config."
+        )
+    ]
+
+
+def _exclude_local_models(
+    prepared: _Prepared,
+    excluded: set[str],
+    workflow: dict[str, Any],
+) -> None:
     """
-    The job parameter values the submitter fills in. WorkflowFile isn't known until the bundle
-    exists.
+    Leaves out the local models the artist removed, by model ID, and warns about them like any
+    others. A name on its own, from a panel older than model IDs, leaves out every model of that
+    name.
     """
-    return {
-        "OutputDir": folder_paths.get_output_directory(),
-        "InputDir": folder_paths.get_input_directory(),
+    # Only an entry that matches no model ID is a name on its own.
+    names = excluded - set(prepared.local_models)
+    kept = {
+        key: path
+        for key, path in prepared.local_models.items()
+        if key not in excluded and model_name(key) not in names
     }
+    if kept == prepared.local_models:
+        return
+    prepared.local_models = kept
+    prepared.warnings = [w for w in prepared.warnings if w not in prepared.model_warnings]
+    prepared.model_warnings = _model_warnings(workflow, prepared.local_models)
+    prepared.warnings.extend(prepared.model_warnings)
+
+
+def _local_model_paths(
+    ui_workflow: Any, api_workflow: dict[str, Any]
+) -> tuple[dict[str, Path], dict[str, str]]:
+    """Local files for the models the workflow loads. A failed lookup finds none."""
+    try:
+        return find_workflow_local_models(
+            ui_workflow, api_workflow, folder_paths.folder_names_and_paths
+        )
+    except Exception:
+        logger.exception("Couldn't resolve local models")
+        return {}, {}
 
 
 def _local_assets(workflow: dict[str, Any]) -> LocalAssets:
@@ -254,14 +382,63 @@ def _save_asset_references(
     workflow: dict[str, Any],
     bundle_dir: Path,
     assets: LocalAssets | None = None,
+    extra_filenames: Iterable[Path] | None = None,
 ) -> None:
-    """Saves the workflow's local input files to asset_references.yaml next to the job template."""
+    """
+    Saves the workflow's local input files, and the staged models in extra_filenames, to
+    asset_references.yaml next to the job template.
+    """
     try:
         chosen = assets if assets is not None else _local_assets(workflow)
+        if extra_filenames:
+            chosen.filenames = sorted(set(chosen.filenames).union(extra_filenames))
         write_asset_references(chosen, bundle_dir / "asset_references.yaml")
     except Exception:
         # The submitter still works without the references. The artist can add files in its dialog.
         logger.exception("Couldn't save asset_references.yaml")
+
+
+def _submissions_dir() -> Path:
+    return Path(folder_paths.get_user_directory()) / "deadline_submissions"
+
+
+def _remove_bundle(bundle_dir: Path | None) -> None:
+    """
+    Deletes a submission's job bundle, with its copies of models. Deadline Cloud has the job, and
+    job attachments has its files, so the bundle isn't needed.
+    """
+    if bundle_dir is not None and (bundle_dir / SUBMISSION_MARKER).is_file():
+        _delete_bundle(bundle_dir)
+
+
+def _delete_bundle(bundle_dir: Path) -> None:
+    """
+    Deletes a marked bundle. What can't be deleted, such as a file another program has open, is
+    marked again, so a later sweep tries again.
+    """
+    shutil.rmtree(bundle_dir, ignore_errors=True)
+    if bundle_dir.exists():
+        logger.warning("Couldn't delete all of the job bundle %s", _log_value(bundle_dir))
+        try:
+            write_private_text(bundle_dir / SUBMISSION_MARKER, "")
+        except OSError:
+            logger.warning("Couldn't mark %s to delete later", _log_value(bundle_dir))
+
+
+def _remove_old_submissions(submissions_dir: Path, age: float = OLD_SUBMISSION_AGE) -> None:
+    """Deletes submissions' bundles older than age seconds, such as from a failed submission."""
+    cutoff = time.time() - age
+    try:
+        bundles = list(submissions_dir.iterdir())
+    except OSError:
+        return
+    for bundle_dir in bundles:
+        try:
+            marker = bundle_dir / SUBMISSION_MARKER
+            if marker.is_file() and marker.stat().st_mtime < cutoff:
+                _delete_bundle(bundle_dir)
+        except OSError:
+            logger.warning("Couldn't delete the old job bundle %s", _log_value(bundle_dir))
 
 
 def _start(coroutine) -> None:
@@ -272,20 +449,32 @@ def _start(coroutine) -> None:
 
 def _plan(body: dict[str, Any], workflow: dict[str, Any], template: Path) -> dict[str, Any]:
     """Works out the panel's plan. It reads files, so it runs in a thread. Raises SubmitError."""
-    conda_channels = resolve_conda_channels(load_config())
+    prepared = _prepare(body, workflow, template, load_config())
     job_template = read_job_template(template)
     assets = _local_assets(workflow)
     return {
         "name": _workflow_name(body),
         "template": template.name,
         "parameters": job_template.get("parameterDefinitions", []),
-        "values": _filled_values(),
-        "queueValues": ({CONDA_CHANNELS_PARAMETER: conda_channels} if conda_channels else {}),
+        "values": prepared.values,
+        "queueValues": (
+            {CONDA_CHANNELS_PARAMETER: prepared.conda_channels} if prepared.conda_channels else {}
+        ),
         "attachments": {
             "filenames": [str(path) for path in assets.filenames],
             "directories": [str(path) for path in assets.directories],
         },
-        "warnings": [],
+        # Attached when submitting.
+        "localModels": [
+            {
+                "id": key,
+                "name": model_name(key),
+                "directory": prepared.model_directories.get(key),
+                "path": str(path),
+            }
+            for key, path in prepared.local_models.items()
+        ],
+        "warnings": prepared.warnings,
     }
 
 
@@ -395,6 +584,15 @@ async def call_deadline_cloud(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+def _model_ids(value: Any) -> set[str]:
+    """The local models the artist chose not to attach. Raises SubmitError."""
+    if value is None:
+        return set()
+    if not isinstance(value, list) or not all(isinstance(name, str) for name in value):
+        raise SubmitError("excludedModels must be a list of model IDs.")
+    return set(value)
+
+
 def _string_map(value: Any, what: str) -> dict[str, Any]:
     """Checks a {name: value} object of parameter values or job settings. Raises SubmitError."""
     if value is None:
@@ -428,14 +626,26 @@ class _Bundle:
     bundle_dir: Path
     workflow_path: Path
     values: dict[str, Any]
+    warnings: list[str]
 
 
-async def _build_bundle(body: dict[str, Any], workflow: dict[str, Any], template: Path) -> _Bundle:
-    """Creates the job bundle from the panel's values. Raises SubmitError."""
+async def _build_bundle(
+    body: dict[str, Any],
+    workflow: dict[str, Any],
+    template: Path,
+    config: dict[str, Any],
+    submission: bool = True,
+) -> _Bundle:
+    """
+    Creates the job bundle from the panel's values. A bundle for a submission is marked, to delete
+    when the submission is done. Raises SubmitError.
+    """
     parameters = _string_map(body.get("parameters"), "parameters")
     assets = _attachments(body.get("attachments"))
+    excluded_models = _model_ids(body.get("excludedModels"))
     description = job_description(body.get("description"))
 
+    prepared = await asyncio.to_thread(_prepare, body, workflow, template, config)
     defined = {
         parameter.get("name")
         for parameter in read_job_template(template).get("parameterDefinitions", [])
@@ -444,16 +654,29 @@ async def _build_bundle(body: dict[str, Any], workflow: dict[str, Any], template
         template,
         workflow,
         _workflow_name(body),
-        Path(folder_paths.get_user_directory()) / "deadline_submissions",
+        _submissions_dir(),
         description=description,
     )
-    await asyncio.to_thread(_save_asset_references, workflow, bundle_dir, assets)
+    # Marked before the models are staged, so a bundle left by a crash while copying them is
+    # still deleted.
+    if submission:
+        try:
+            write_private_text(bundle_dir / SUBMISSION_MARKER, "")
+        except OSError:
+            logger.warning("Couldn't mark %s to delete after submitting", _log_value(bundle_dir))
+    _exclude_local_models(prepared, excluded_models, workflow)
+    # Copying models can take a while when the bundle is on another volume.
+    staged = await asyncio.to_thread(_stage_prepared, prepared, workflow, bundle_dir)
+    await asyncio.to_thread(_save_asset_references, workflow, bundle_dir, assets, staged.filenames)
 
     # The artist's values win over the ones the submitter fills in, except the workflow file. The
     # library rejects parameters that neither the job template nor the queue defines.
-    filled = {key: value for key, value in _filled_values().items() if key in defined}
+    filled = {key: value for key, value in prepared.values.items() if key in defined}
     values = {**filled, **parameters, "WorkflowFile": str(workflow_path)}
-    return _Bundle(bundle_dir, workflow_path, values)
+    # Attached models are only mapped through this directory, so it wins over the panel's value.
+    if staged.model_dir is not None:
+        values["ModelDirectory"] = str(staged.model_dir)
+    return _Bundle(bundle_dir, workflow_path, values, prepared.warnings)
 
 
 @PromptServer.instance.routes.post("/deadline/jobs")
@@ -479,9 +702,11 @@ async def submit_job(request: web.Request) -> web.Response:
     if isinstance(cli, web.Response):
         return cli
     try:
-        bundle = await _build_bundle(body, workflow, template)
+        bundle = await _build_bundle(body, workflow, template, config)
     except SubmitError as e:
         return _error(400, str(e))
+    # A server that runs for weeks also deletes old bundles, not only when ComfyUI starts.
+    _start(asyncio.to_thread(_remove_old_submissions, _submissions_dir()))
 
     settings.setdefault("name", f"ComfyUI - {name}")
     submission = {
@@ -512,7 +737,7 @@ async def submit_job(request: web.Request) -> web.Response:
     else:
         submission_id = uuid.uuid4().hex
     _submissions[submission_id] = _Submission(
-        str(settings["name"]), process, client_id=_client_id(body)
+        str(settings["name"]), process, client_id=_client_id(body), bundle_dir=bundle.bundle_dir
     )
     logger.info(
         "Submitting %s to Deadline Cloud from %s",
@@ -525,7 +750,7 @@ async def submit_job(request: web.Request) -> web.Response:
             "submissionId": submission_id,
             "job_bundle": str(bundle.bundle_dir),
             "workflow_file": str(bundle.workflow_path),
-            "warnings": [],
+            "warnings": bundle.warnings,
         },
         status=202,
     )
@@ -578,9 +803,12 @@ async def _watch_submission(submission_id: str) -> None:
             _log_value(result["jobId"]),
         )
         _send(SUBMITTED_EVENT, {**base, **result, "status": "SUBMITTED"}, submission.client_id)
+        await asyncio.to_thread(_remove_bundle, submission.bundle_dir)
     elif submission.canceled:
         _send(SUBMITTED_EVENT, {**base, "status": "CANCELED"}, submission.client_id)
+        await asyncio.to_thread(_remove_bundle, submission.bundle_dir)
     else:
+        # A failed submission's bundle is kept for a day, to look into or submit again.
         error = _bridge_failure(events, stderr, process.returncode)
         logger.error(
             "Couldn't submit %s to Deadline Cloud: %s",
@@ -691,3 +919,11 @@ async def choose_paths(request: web.Request) -> web.Response:
     if process.returncode != 0:
         paths = []
     return web.json_response({"paths": [str(Path(path)) for path in paths if path]})
+
+
+# Deletes old bundles in the background, so ComfyUI's start doesn't wait on slow storage.
+threading.Thread(
+    target=lambda: _remove_old_submissions(_submissions_dir()),
+    name="deadline-old-submissions",
+    daemon=True,
+).start()

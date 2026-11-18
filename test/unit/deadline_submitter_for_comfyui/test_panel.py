@@ -130,3 +130,9 @@ def test_a_queue_parameter_the_template_defines_defaults_to_the_templates_value(
         "cleared": "comfy",
         "shownAfterClearing": "comfy",
     }
+
+
+def test_a_model_is_removed_by_its_folder_and_name(run_scenario):
+    """Two models with the same file name, in different folders, are removed one at a time."""
+    result = run_scenario("same-name-models")
+    assert result["excludedModels"] == ["loras/shared.safetensors"]

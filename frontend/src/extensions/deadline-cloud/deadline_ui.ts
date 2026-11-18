@@ -61,7 +61,9 @@ interface Plan {
   values?: Record<string, ParameterValue>;
   queueValues?: Record<string, string>;
   attachments?: PathLists;
-  localModels?: { name: string; directory: string | null; path: string }[];
+  // id is the model's folder and name, such as checkpoints/sd.safetensors. Two models can share a
+  // name in different folders.
+  localModels?: { id: string; name: string; directory: string | null; path: string }[];
   warnings?: string[];
 }
 
@@ -1221,7 +1223,7 @@ function renderJobSettings() {
 function excludedModels(): string[] {
   return (state.plan?.localModels ?? [])
     .filter((model) => state.removedAttachments.has(model.path))
-    .map((model) => model.name);
+    .map((model) => model.id);
 }
 
 function attachmentItem(
@@ -1330,7 +1332,7 @@ function renderAttachments() {
             { className: "dl-files" },
             localModels.map((model) =>
               attachmentItem(
-                model.name,
+                model.id,
                 model.path,
                 null,
                 toggleModel(model, true),

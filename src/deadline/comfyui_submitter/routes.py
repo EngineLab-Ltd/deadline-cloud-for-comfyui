@@ -30,6 +30,7 @@ from .get_local_assets import (
     LocalAssets,
     find_workflow_local_models,
     get_local_assets,
+    model_name,
     stage_local_models,
     write_asset_references,
 )
@@ -114,8 +115,8 @@ class _Prepared:
     values: dict[str, Any] = field(default_factory=dict)
     conda_channels: str | None = None
     warnings: list[str] = field(default_factory=list)
-    # Local files for the models the workflow loads, by the name it loads them by, and the model
-    # folder of each.
+    # Local files for the models the workflow loads, and the model folder of each, by model ID:
+    # the folder and the name the workflow loads it by.
     local_models: dict[str, Path] = field(default_factory=dict)
     model_directories: dict[str, str] = field(default_factory=dict)
     model_warnings: list[str] = field(default_factory=list)
@@ -313,8 +314,9 @@ def _stage_local_models(
 
 
 def _model_warnings(workflow: dict[str, Any], attached: dict[str, Path]) -> list[str]:
-    """A warning for loaded models that aren't attached."""
-    missing = [name for name in workflow_models(workflow) if name not in attached]
+    """A warning for loaded models that aren't attached. attached is by model ID."""
+    names = {model_name(key) for key in attached}
+    missing = [name for name in workflow_models(workflow) if name not in names]
     if not missing:
         return []
     return [
@@ -330,12 +332,21 @@ def _exclude_local_models(
     excluded: set[str],
     workflow: dict[str, Any],
 ) -> None:
-    """Leaves out the local models the artist removed, and warns about them like any others."""
-    if not excluded.intersection(prepared.local_models):
-        return
-    prepared.local_models = {
-        name: path for name, path in prepared.local_models.items() if name not in excluded
+    """
+    Leaves out the local models the artist removed, by model ID, and warns about them like any
+    others. A name on its own, from a panel older than model IDs, leaves out every model of that
+    name.
+    """
+    # Only an entry that matches no model ID is a name on its own.
+    names = excluded - set(prepared.local_models)
+    kept = {
+        key: path
+        for key, path in prepared.local_models.items()
+        if key not in excluded and model_name(key) not in names
     }
+    if kept == prepared.local_models:
+        return
+    prepared.local_models = kept
     prepared.warnings = [w for w in prepared.warnings if w not in prepared.model_warnings]
     prepared.model_warnings = _model_warnings(workflow, prepared.local_models)
     prepared.warnings.extend(prepared.model_warnings)
@@ -456,11 +467,12 @@ def _plan(body: dict[str, Any], workflow: dict[str, Any], template: Path) -> dic
         # Attached when submitting.
         "localModels": [
             {
-                "name": name,
-                "directory": prepared.model_directories.get(name),
+                "id": key,
+                "name": model_name(key),
+                "directory": prepared.model_directories.get(key),
                 "path": str(path),
             }
-            for name, path in prepared.local_models.items()
+            for key, path in prepared.local_models.items()
         ],
         "warnings": prepared.warnings,
     }
@@ -572,12 +584,12 @@ async def call_deadline_cloud(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
-def _model_names(value: Any) -> set[str]:
+def _model_ids(value: Any) -> set[str]:
     """The local models the artist chose not to attach. Raises SubmitError."""
     if value is None:
         return set()
     if not isinstance(value, list) or not all(isinstance(name, str) for name in value):
-        raise SubmitError("excludedModels must be a list of model names.")
+        raise SubmitError("excludedModels must be a list of model IDs.")
     return set(value)
 
 
@@ -630,7 +642,7 @@ async def _build_bundle(
     """
     parameters = _string_map(body.get("parameters"), "parameters")
     assets = _attachments(body.get("attachments"))
-    excluded_models = _model_names(body.get("excludedModels"))
+    excluded_models = _model_ids(body.get("excludedModels"))
     description = job_description(body.get("description"))
 
     prepared = await asyncio.to_thread(_prepare, body, workflow, template, config)

@@ -148,7 +148,19 @@ if (scenario === "edited-before-replanning") {
   result.submission = state.submission;
   result.canSubmit = Boolean(ui.canSubmit());
   result.toasts = app.toasts.map(({ severity }) => severity);
+} else if (scenario === "same-name-models") {
+  // A checkpoint and a LoRA share a file name. Removing one leaves the other attached.
+  const model = (directory) => ({
+    id: `${directory}/shared.safetensors`,
+    name: "shared.safetensors",
+    directory,
+    path: `/models/${directory}/shared.safetensors`,
+  });
+  state.plan.localModels = [model("checkpoints"), model("loras")];
+  state.removedAttachments.add("/models/loras/shared.safetensors");
+  await ui.submit();
+  await settle();
+  result.excludedModels = api.calls.filter(({ path }) => path === "/deadline/jobs").at(-1).body.excludedModels;
 }
-
 console.log(JSON.stringify(result));
 process.exit(0);

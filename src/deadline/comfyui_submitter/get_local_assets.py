@@ -145,19 +145,33 @@ def find_local_model(folders: ModelFolders, directory: str, name: str) -> Path |
     return None
 
 
+def model_id(directory: str, name: str) -> str:
+    """
+    What identifies a local model: its model folder and the name the workflow loads it by, such
+    as checkpoints/sd.safetensors. Two models can share a name in different folders.
+    """
+    return f"{directory}/{name}"
+
+
+def model_name(key: str) -> str:
+    """The name part of a model ID. ComfyUI's model folder names don't contain "/"."""
+    return key.split("/", 1)[-1]
+
+
 def stage_local_models(
     models: Mapping[str, Path], directories: Mapping[str, str], dest: Path
 ) -> dict[str, Path]:
     """
-    Places each model at dest/<directory>/<name> and returns the workflow name mapped to that path.
-    The destination matches the model folders in the job's extra model paths config, so ComfyUI on
-    the worker loads the original file name from the mapped model directory. A hard link is used
-    when the destination is on the same volume; otherwise the file is copied. A file that cannot
-    be placed is logged and left out.
+    Places each model at dest/<directory>/<name> and returns the path of each, by model ID.
+    models and directories are by model ID too. The destination matches the model folders in the
+    job's extra model paths config, so ComfyUI on the worker loads the original file name from the
+    mapped model directory. A hard link is used when the destination is on the same volume;
+    otherwise the file is copied. A file that cannot be placed is logged and left out.
     """
     staged: dict[str, Path] = {}
-    for name, source in models.items():
-        directory = directories.get(name)
+    for key, source in models.items():
+        directory = directories.get(key)
+        name = model_name(key)
         relative = _model_relative_path(directory, name)
         if relative is None:
             continue
@@ -185,7 +199,7 @@ def stage_local_models(
         except OSError:
             logger.exception("Couldn't stage model %r from %s", name, source)
             continue
-        staged[name] = target
+        staged[key] = target
     return dict(sorted(staged.items()))
 
 
@@ -204,34 +218,36 @@ def find_workflow_local_models(
 ) -> tuple[dict[str, Path], dict[str, str]]:
     """
     Local files for the models the workflow loads. The names are the same list as
-    workflow_models. The folder comes from the loader's properties, or from
-    the subgraph definition when the file name is on a subgraph widget. Without a folder, every
-    registered model folder is searched. Missing files are logged and omitted.
+    workflow_models. The folder comes from the loader's properties, or from the subgraph
+    definition when the file name is on a subgraph widget. Without a folder, or when the folder
+    doesn't have the file, every registered model folder is searched, and a name found in more
+    than one folder is attached from each, since the workflow doesn't say which loader reads
+    which. Missing files are logged and omitted.
 
-    Returns the local path and folder type for each file to stage as a job attachment.
+    Returns, by model ID, the local path and folder type of each file to stage as a job attachment.
     """
     if not isinstance(api_workflow, dict):
         return {}, {}
-    missing = workflow_models(api_workflow)
     known = _model_directories(ui_workflow)
     found: dict[str, Path] = {}
     directories: dict[str, str] = {}
-    for name in missing:
-        directory = known.get(name)
-        located = _search_local_model(folders, name, directory)
-        if located is None:
-            logger.warning("No local file for model %r in folder %r", name, directory)
-            continue
-        path, folder = located
-        found[name] = path
-        directories[name] = folder
+    for name in workflow_models(api_workflow):
+        located = _search_local_models(folders, name, known.get(name, []))
+        if not located:
+            logger.warning("No local file for model %r in folders %r", name, known.get(name))
+        for path, folder in located:
+            found[model_id(folder, name)] = path
+            directories[model_id(folder, name)] = folder
     return found, directories
 
 
-def _model_directories(ui_workflow: Any) -> dict[str, str | None]:
-    """Maps a model file name written on a UI node to its ComfyUI folder, when one is known."""
+def _model_directories(ui_workflow: Any) -> dict[str, list[tuple[str, bool]]]:
+    """
+    Maps a model file name written on UI nodes to the ComfyUI folders they load it from, each with
+    whether the loader declares it, rather than it being a guess from a subgraph.
+    """
     subgraphs = _subgraphs_by_id(ui_workflow)
-    directories: dict[str, str | None] = {}
+    directories: dict[str, list[tuple[str, bool]]] = {}
     nodes = ui_workflow.get("nodes") if isinstance(ui_workflow, Mapping) else None
     if not isinstance(nodes, list):
         return directories
@@ -242,10 +258,11 @@ def _model_directories(ui_workflow: Any) -> dict[str, str | None]:
         node_type = node.get("type")
         subgraph = subgraphs.get(node_type) if isinstance(node_type, str) else None
         for filename in _model_filenames(node):
+            hint = _model_directory(node, filename, subgraph)
             # workflow_models normalizes separators, so the lookup key has to match.
-            directories.setdefault(
-                filename.replace("\\", "/"), _model_directory(node, filename, subgraph)
-            )
+            folders = directories.setdefault(filename.replace("\\", "/"), [])
+            if hint and hint not in folders:
+                folders.append(hint)
     return directories
 
 
@@ -396,35 +413,46 @@ def _linked_directory(
 
 def _model_directory(
     node: Mapping[str, Any], filename: str, subgraph: Mapping[str, Any] | None
-) -> str | None:
-    return _directory_from_models(_node_models(node), filename) or _linked_directory(
-        node, filename, subgraph
-    )
+) -> tuple[str, bool] | None:
+    """The folder a node loads a model file from, and whether the node declares it."""
+    declared = _directory_from_models(_node_models(node), filename)
+    if declared:
+        return declared, True
+    guessed = _linked_directory(node, filename, subgraph)
+    return (guessed, False) if guessed else None
 
 
 # Folder names ComfyUI still accepts from older workflows, as its folder_paths.map_legacy does.
 _LEGACY_FOLDERS = {"clip": "text_encoders", "unet": "diffusion_models"}
 
 
-def _search_local_model(
-    folders: ModelFolders, name: str, directory: str | None
-) -> tuple[Path, str] | None:
+def _search_local_models(
+    folders: ModelFolders, name: str, hints: Sequence[tuple[str, bool]]
+) -> list[tuple[Path, str]]:
     """
-    The local file and the folder it was found in, or None when it is missing. The folder the
-    workflow names is searched first. It can be a legacy name, or a guess from a subgraph, so the
-    other folders are searched when it doesn't have the file.
+    The local files for a model name, and the folder each was found in. hints are the folders the
+    workflow names, each with whether its loader declares it. They're searched first. A loader
+    on the worker only reads its declared folder, so when that doesn't have the file, the model
+    isn't found. Otherwise, such as for a guess from a subgraph or a folder ComfyUI doesn't
+    register, every folder is searched.
     """
-    if directory and directory not in folders:
-        directory = _LEGACY_FOLDERS.get(directory, directory)
-    for folder_name in [directory] if directory else []:
-        path = find_local_model(folders, folder_name, name)
-        if path is not None:
-            return path, folder_name
-    for folder_name in folders:
-        path = find_local_model(folders, folder_name, name)
-        if path is not None:
-            return path, folder_name
-    return None
+    hinted = [
+        (_LEGACY_FOLDERS.get(hint, hint) if hint not in folders else hint, declared)
+        for hint, declared in hints
+    ]
+    certain = any(declared and hint in folders for hint, declared in hinted)
+    searches = [dict.fromkeys(hint for hint, _ in hinted)]
+    if not certain:
+        searches.append(dict.fromkeys(folders))
+    for candidates in searches:
+        located = [
+            (path, folder_name)
+            for folder_name in candidates
+            if (path := find_local_model(folders, folder_name, name)) is not None
+        ]
+        if located:
+            return located
+    return []
 
 
 def _literal_strings(workflow: Mapping[str, Any]) -> Iterable[str]:

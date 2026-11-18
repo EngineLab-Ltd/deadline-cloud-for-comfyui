@@ -62,6 +62,7 @@ def comfy(monkeypatch, tmp_path):
             folder_names_and_paths={
                 "checkpoints": ([str(tmp_path / "models" / "checkpoints")], {".safetensors"}),
                 "vae": ([str(tmp_path / "models" / "vae")], {".safetensors"}),
+                "loras": ([str(tmp_path / "models" / "loras")], {".safetensors"}),
             },
         ),
     )
@@ -1123,7 +1124,12 @@ def test_plan_lists_local_models_and_doesnt_warn_about_them(comfy, monkeypatch):
     status, body = run(call(comfy, "/deadline/plan", {"workflow": WORKFLOW, "name": "fox"}))
     assert status == 200
     assert body["localModels"] == [
-        {"name": "m.safetensors", "directory": "checkpoints", "path": str(checkpoint)}
+        {
+            "id": "checkpoints/m.safetensors",
+            "name": "m.safetensors",
+            "directory": "checkpoints",
+            "path": str(checkpoint),
+        }
     ]
     assert body["warnings"] == []
     # Planning doesn't stage anything.
@@ -1276,6 +1282,40 @@ def test_old_submission_bundles_are_deleted_when_comfyui_starts(comfy):
     assert sorted(path.name for path in submissions.iterdir()) == ["recent", "saved"]
 
 
+@pytest.mark.parametrize(
+    ("excluded", "attached"),
+    [
+        (["loras/shared.safetensors"], ["checkpoints"]),
+        ([], ["checkpoints", "loras"]),
+        # A panel older than model IDs leaves out every model of the name.
+        (["shared.safetensors"], []),
+    ],
+)
+def test_jobs_attach_and_exclude_models_by_folder_and_name(comfy, monkeypatch, excluded, attached):
+    """A checkpoint and a LoRA can share a file name, and each is attached or removed on its own."""
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    requests = fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [result({"jobId": "job-1"})]})
+    for folder in ("checkpoints", "loras"):
+        (comfy.tmp_path / "models" / folder).mkdir(parents=True)
+        (comfy.tmp_path / "models" / folder / "shared.safetensors").write_bytes(b"model")
+    workflow = {
+        "4": {
+            "class_type": "CheckpointLoaderSimple",
+            "inputs": {"ckpt_name": "shared.safetensors"},
+        },
+        "5": {"class_type": "LoraLoader", "inputs": {"lora_name": "shared.safetensors"}},
+        "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "fox"}},
+    }
+    body = {**JOB, "workflow": workflow, "parameters": {}, "excludedModels": excluded}
+    status, response = run(call(comfy, "/deadline/jobs", body))
+    assert status == 202
+    staged = Path(response["job_bundle"]) / "local_models"
+    assert sorted(path.parent.name for path in staged.glob("*/shared.safetensors")) == attached
+    assert bool(response["warnings"]) is not bool(attached)
+    sent = bridge_requests(requests)[0]["request"]["parameters"]
+    assert ("ModelDirectory" in sent) is bool(attached)
+
+
 def test_a_bundle_that_cant_all_be_deleted_is_marked_again(comfy, monkeypatch, caplog):
     """Such as a file an antivirus has open on Windows. A later sweep tries again."""
     bundle = comfy.tmp_path / "bundle"
@@ -1319,3 +1359,29 @@ def test_jobs_delete_old_bundles_too(comfy, monkeypatch):
     status, _ = run(post(comfy, {"workflow": WORKFLOW}))
     assert status == 202
     assert not old.exists()
+
+
+def test_jobs_dont_read_a_model_id_as_another_models_name(comfy, monkeypatch):
+    """A LoRA in a loras/checkpoints/ subfolder has the name checkpoints/x.safetensors."""
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [result({"jobId": "job-1"})]})
+    for relative in ("checkpoints/x.safetensors", "loras/checkpoints/x.safetensors"):
+        (comfy.tmp_path / "models" / relative).parent.mkdir(parents=True, exist_ok=True)
+        (comfy.tmp_path / "models" / relative).write_bytes(b"model")
+    workflow = {
+        "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "x.safetensors"}},
+        "5": {"class_type": "LoraLoader", "inputs": {"lora_name": "checkpoints/x.safetensors"}},
+        "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "fox"}},
+    }
+    body = {
+        **JOB,
+        "workflow": workflow,
+        "parameters": {},
+        "excludedModels": ["checkpoints/x.safetensors"],
+    }
+    status, response = run(call(comfy, "/deadline/jobs", body))
+    assert status == 202
+    staged = Path(response["job_bundle"]) / "local_models"
+    assert [path.relative_to(staged).as_posix() for path in staged.rglob("*.safetensors")] == [
+        "loras/checkpoints/x.safetensors"
+    ]

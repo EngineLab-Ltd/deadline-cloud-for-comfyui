@@ -7,6 +7,7 @@ import yaml
 
 from deadline.comfyui_submitter.get_local_assets import (
     LocalAssets,
+    _search_local_models,
     find_local_model,
     find_workflow_local_models,
     get_local_assets,
@@ -177,8 +178,8 @@ def test_find_workflow_local_models_skips_missing_files(comfy, caplog):
         }
     }
     found, directories = find_workflow_local_models(ui, api, folders)
-    assert found == {"custom.safetensors": path}
-    assert directories == {"custom.safetensors": "checkpoints"}
+    assert found == {"checkpoints/custom.safetensors": path}
+    assert directories == {"checkpoints/custom.safetensors": "checkpoints"}
     assert "gone.safetensors" in caplog.text
 
 
@@ -200,11 +201,11 @@ def test_stage_local_models_skips_a_file_that_cannot_be_placed(comfy, tmp_path, 
     monkeypatch.setattr("deadline.comfyui_submitter.get_local_assets.shutil.copy2", fail_copy)
     dest = tmp_path / "local_models"
     staged = stage_local_models(
-        {"kept.safetensors": kept, "dropped.safetensors": dropped},
-        {"kept.safetensors": "checkpoints", "dropped.safetensors": "loras"},
+        {"checkpoints/kept.safetensors": kept, "loras/dropped.safetensors": dropped},
+        {"checkpoints/kept.safetensors": "checkpoints", "loras/dropped.safetensors": "loras"},
         dest,
     )
-    assert staged == {"kept.safetensors": dest / "checkpoints" / "kept.safetensors"}
+    assert staged == {"checkpoints/kept.safetensors": dest / "checkpoints" / "kept.safetensors"}
     assert not (dest / "loras" / "dropped.safetensors").exists()
 
 
@@ -213,12 +214,18 @@ def test_stage_local_models_uses_comfy_folder_layout(comfy, tmp_path):
     secret = touch(tmp_path / "secret.safetensors")
     dest = tmp_path / "local_models"
     staged = stage_local_models(
-        {"nested/custom.safetensors": source, "../../secret.safetensors": secret},
-        {"nested/custom.safetensors": "checkpoints", "../../secret.safetensors": "checkpoints"},
+        {
+            "checkpoints/nested/custom.safetensors": source,
+            "checkpoints/../../secret.safetensors": secret,
+        },
+        {
+            "checkpoints/nested/custom.safetensors": "checkpoints",
+            "checkpoints/../../secret.safetensors": "checkpoints",
+        },
         dest,
     )
     expected = dest / "checkpoints" / "nested" / "custom.safetensors"
-    assert staged == {"nested/custom.safetensors": expected}
+    assert staged == {"checkpoints/nested/custom.safetensors": expected}
     assert expected.read_bytes() == source.read_bytes()
     assert expected.stat().st_ino == source.stat().st_ino
     assert not (dest / "checkpoints" / "secret.safetensors").exists()
@@ -244,8 +251,8 @@ def test_find_workflow_local_models_reads_extensions_under_nodes(tmp_path):
     }
     api = {"1": {"inputs": {name: name for name in [*names, "photo.png"]}}}
     found, directories = find_workflow_local_models(ui, api, folders)
-    assert found == {name: checkpoints / name for name in names}
-    assert directories == {name: "checkpoints" for name in names}
+    assert found == {f"checkpoints/{name}": checkpoints / name for name in names}
+    assert directories == {f"checkpoints/{name}": "checkpoints" for name in names}
 
 
 def test_find_workflow_local_models_reads_properties_on_a_node_inside_a_subgraph(tmp_path):
@@ -318,13 +325,16 @@ def test_find_workflow_local_models_reads_properties_on_a_node_inside_a_subgraph
         "2": {"inputs": {"lora_name": "style.safetensors"}},
     }
     found, directories = find_workflow_local_models(ui, api, folders)
-    assert found == {"sd.safetensors": checkpoint, "style.safetensors": kept}
-    assert directories == {"sd.safetensors": "checkpoints", "style.safetensors": "loras"}
+    assert found == {"checkpoints/sd.safetensors": checkpoint, "loras/style.safetensors": kept}
+    assert directories == {
+        "checkpoints/sd.safetensors": "checkpoints",
+        "loras/style.safetensors": "loras",
+    }
     dest = tmp_path / "local_models"
     staged = stage_local_models(found, directories, dest)
     assert staged == {
-        "sd.safetensors": dest / "checkpoints" / "sd.safetensors",
-        "style.safetensors": dest / "loras" / "style.safetensors",
+        "checkpoints/sd.safetensors": dest / "checkpoints" / "sd.safetensors",
+        "loras/style.safetensors": dest / "loras" / "style.safetensors",
     }
 
 
@@ -339,8 +349,8 @@ def test_find_workflow_local_models_searches_registered_folders_without_a_direct
     ui = {"nodes": [{"widgets_values": ["style.pt", "notes.txt"]}]}
     api = {"1": {"inputs": {"lora_name": "style.pt", "ckpt_name": "other.ckpt"}}}
     found, directories = find_workflow_local_models(ui, api, folders)
-    assert found == {"other.ckpt": other, "style.pt": path}
-    assert directories == {"other.ckpt": "checkpoints", "style.pt": "loras"}
+    assert found == {"checkpoints/other.ckpt": other, "loras/style.pt": path}
+    assert directories == {"checkpoints/other.ckpt": "checkpoints", "loras/style.pt": "loras"}
 
 
 @pytest.mark.parametrize(
@@ -353,28 +363,39 @@ def test_find_workflow_local_models_maps_legacy_folder_names(tmp_path, hint, fol
     ui = {"nodes": [{"properties": {"models": [{"directory": hint, "name": "m.safetensors"}]}}]}
     api = {"1": {"inputs": {"clip_name": "m.safetensors"}}}
     assert find_workflow_local_models(ui, api, folders) == (
-        {"m.safetensors": path},
-        {"m.safetensors": folder},
+        {f"{folder}/m.safetensors": path},
+        {f"{folder}/m.safetensors": folder},
     )
 
 
-def test_find_workflow_local_models_searches_every_folder_when_the_hint_misses(tmp_path):
-    """A wrong folder hint, such as one guessed from a subgraph, doesn't hide a local model."""
-    path = touch(tmp_path / "vae" / "m.safetensors")
+def test_find_workflow_local_models_trusts_the_folder_a_loader_declares(tmp_path, caplog):
+    """The worker's loader only reads its folder, so a file elsewhere wouldn't help it."""
+    touch(tmp_path / "vae" / "m.safetensors")
     folders = {
         "checkpoints": ([str(tmp_path / "checkpoints")], set[str]()),
-        "vae": ([str(path.parent)], set[str]()),
+        "vae": ([str(tmp_path / "vae")], set[str]()),
     }
     ui = {
         "nodes": [
             {"properties": {"models": [{"directory": "checkpoints", "name": "m.safetensors"}]}}
         ]
     }
-    api = {"1": {"inputs": {"vae_name": "m.safetensors"}}}
-    assert find_workflow_local_models(ui, api, folders) == (
-        {"m.safetensors": path},
-        {"m.safetensors": "vae"},
-    )
+    api = {"1": {"inputs": {"ckpt_name": "m.safetensors"}}}
+    assert find_workflow_local_models(ui, api, folders) == ({}, {})
+    assert "m.safetensors" in caplog.text
+
+
+@pytest.mark.parametrize("hint", [("checkpoints", False), ("my_models", True)])
+def test_find_workflow_local_models_searches_every_folder_when_an_unsure_hint_misses(
+    tmp_path, hint
+):
+    """A guess from a subgraph, or a folder ComfyUI doesn't register, doesn't hide a model."""
+    path = touch(tmp_path / "vae" / "m.safetensors")
+    folders = {
+        "checkpoints": ([str(tmp_path / "checkpoints")], set[str]()),
+        "vae": ([str(path.parent)], set[str]()),
+    }
+    assert _search_local_models(folders, "m.safetensors", [hint]) == [(path, "vae")]
 
 
 def test_stage_local_models_warns_when_it_copies_a_model(comfy, tmp_path, monkeypatch, caplog):
@@ -386,7 +407,54 @@ def test_stage_local_models_warns_when_it_copies_a_model(comfy, tmp_path, monkey
 
     monkeypatch.setattr("deadline.comfyui_submitter.get_local_assets.os.link", fail_link)
     dest = tmp_path / "local_models"
-    staged = stage_local_models({"m.safetensors": source}, {"m.safetensors": "checkpoints"}, dest)
-    assert staged == {"m.safetensors": dest / "checkpoints" / "m.safetensors"}
+    key = "checkpoints/m.safetensors"
+    staged = stage_local_models({key: source}, {key: "checkpoints"}, dest)
+    assert staged == {key: dest / "checkpoints" / "m.safetensors"}
     assert "Copying model 'm.safetensors' into the job bundle" in caplog.text
     assert "Invalid cross-device link" in caplog.text
+
+
+def test_models_with_the_same_name_in_different_folders_are_each_attached(tmp_path):
+    """A checkpoint and a LoRA can share a file name. Each loader needs its own."""
+    checkpoint = touch(tmp_path / "checkpoints" / "shared.safetensors")
+    lora = touch(tmp_path / "loras" / "shared.safetensors")
+    folders = {
+        "checkpoints": ([str(checkpoint.parent)], set[str]()),
+        "loras": ([str(lora.parent)], set[str]()),
+        "vae": ([str(tmp_path / "vae")], set[str]()),
+    }
+    api = {
+        "1": {"inputs": {"ckpt_name": "shared.safetensors"}},
+        "2": {"inputs": {"lora_name": "shared.safetensors"}},
+    }
+    expected = (
+        {"checkpoints/shared.safetensors": checkpoint, "loras/shared.safetensors": lora},
+        {"checkpoints/shared.safetensors": "checkpoints", "loras/shared.safetensors": "loras"},
+    )
+    # With the loaders' folders.
+    ui = {
+        "nodes": [
+            {"properties": {"models": [{"directory": folder, "name": "shared.safetensors"}]}}
+            for folder in ("checkpoints", "loras")
+        ]
+    }
+    assert find_workflow_local_models(ui, api, folders) == expected
+    # Without them, every folder with the name.
+    assert find_workflow_local_models({"nodes": []}, api, folders) == expected
+    # With one folder, only that one.
+    ui = {
+        "nodes": [
+            {"properties": {"models": [{"directory": "loras", "name": "shared.safetensors"}]}}
+        ]
+    }
+    assert find_workflow_local_models(ui, api, folders) == (
+        {"loras/shared.safetensors": lora},
+        {"loras/shared.safetensors": "loras"},
+    )
+    # Each is staged in its own folder.
+    dest = tmp_path / "local_models"
+    staged = stage_local_models(*expected, dest)
+    assert staged == {
+        "checkpoints/shared.safetensors": dest / "checkpoints" / "shared.safetensors",
+        "loras/shared.safetensors": dest / "loras" / "shared.safetensors",
+    }

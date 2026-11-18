@@ -157,16 +157,17 @@ uploaded from this machine. The workers have to provide the custom nodes:
   **Input Directory** at them on the worker.
 - **Outputs.** Outputs are returned through job attachments. Download them with Deadline Cloud
   monitor or `deadline job download-output`.
-- **Models.** Workers don't have your local models. The submitter finds each model file the
-  workflow loads in ComfyUI's model folders, the way ComfyUI would, and places it in the job
-  bundle under **Model Directory**, in that model's folder (`checkpoints/`, `loras/`, and so on).
-  Those files are job attachments. Each one is uploaded once, and later jobs reuse it. On the
-  worker, **Model Directory** is the folder those files are mapped to, and ComfyUI loads each
-  model by the name already in the workflow. The job doesn't download models from the internet.
-  When a model isn't on this machine, the panel warns about it, and the job fails unless the
-  workers already have the model, such as in a shared folder that **Extra Model Paths Config**
-  points at. In the panel, **Attachments** lists the models it will attach. Remove one with its
-  **✕** when the workers already have it, and it isn't uploaded.
+- **Models.** Workers don't have your local models. The submitter finds each model file the workflow
+  loads in ComfyUI's model folders, the way ComfyUI would, and places it in the job bundle under
+  **Model Directory**, in that model's folder (`checkpoints/`, `loras/`, and so on). Those files are
+  job attachments. Each one is uploaded once, and later jobs reuse it. On the worker, **Model
+  Directory** is the folder those files are mapped to, and ComfyUI loads each model by the name
+  already in the workflow. The job doesn't download models from the internet. When a model isn't on
+  this machine, the panel warns about it, and the job fails unless the workers already have the
+  model, such as in a shared folder that **Extra Model Paths Config** points at. In the panel,
+  **Attachments** lists the models it will attach. The panel lists each model by its folder and
+  name, such as `loras/style.safetensors`, since two folders can hold files of the same name. Remove
+  one with its **✕** when the workers already have it, and it isn't uploaded.
 - **Custom nodes.** Workers load the custom nodes in the job's conda environment, such as a
   custom nodes conda package added to **Conda Packages**, or in a `custom_nodes` folder that
   **Extra Model Paths Config** lists. The job fails with the import error when a custom node

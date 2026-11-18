@@ -195,18 +195,19 @@ def _custom_node_pack_name(cls: Any) -> str | None:
     """
     The name of the custom node pack ComfyUI loaded this node class from, or None when the node
     isn't from a custom node pack. ComfyUI tags each class it loads with RELATIVE_PYTHON_MODULE,
-    such as "custom_nodes.pack.nodes". V3 extension classes loaded by a ComfyUI release that
-    doesn't tag them still have the pack's file path as their __module__, such as
-    "/ComfyUI/custom_nodes/pack.nodes", which names the pack the same way.
+    "custom_nodes." and the pack's name, which can contain dots, such as "custom_nodes.Pack.v2".
+    V3 extension classes loaded by a ComfyUI release that doesn't tag them still have the pack's
+    path as their __module__, such as "/ComfyUI/custom_nodes/Pack_x_v2.nodes". ComfyUI writes
+    the dots in a pack folder's name as "_x_" there.
     """
     module = str(getattr(cls, "RELATIVE_PYTHON_MODULE", "") or "")
-    parts = module.split(".")
-    if len(parts) >= 2 and parts[0] == "custom_nodes" and parts[1]:
-        return parts[1]
+    prefix = "custom_nodes."
+    if module.startswith(prefix) and len(module) > len(prefix):
+        return module[len(prefix) :]
     path_parts = re.split(r"[/\\]", str(getattr(cls, "__module__", "") or ""))
     for index, part in enumerate(path_parts[:-1]):
         if part == "custom_nodes":
-            pack = path_parts[index + 1].split(".")[0]
+            pack = path_parts[index + 1].split(".")[0].replace("_x_", ".")
             return pack or None
     return None
 

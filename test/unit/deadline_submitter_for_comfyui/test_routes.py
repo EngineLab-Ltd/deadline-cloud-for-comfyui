@@ -1678,7 +1678,7 @@ def _studio_pack(comfy, monkeypatch):
     pack = write_pack(custom / "studio-nodes")
     fake_nodes(
         monkeypatch,
-        {"StudioResize": "custom_nodes.studio-nodes.nodes"},
+        {"StudioResize": "custom_nodes.studio-nodes"},
         {"studio-nodes": pack},
     )
     return pack, {**WORKFLOW, "5": {"class_type": "StudioResize", "inputs": {}}}
@@ -1692,7 +1692,7 @@ def test_jobs_attaches_every_custom_node_pack_the_workflow_uses(comfy, monkeypat
     fake_nodes(
         monkeypatch,
         {
-            "StudioResize": "custom_nodes.studio-nodes.nodes",
+            "StudioResize": "custom_nodes.studio-nodes",
             "ImageResizeKJv2": "custom_nodes.comfyui-kjnodes",
         },
         {"studio-nodes": git_pack, "comfyui-kjnodes": custom / "comfyui-kjnodes"},
@@ -1768,10 +1768,19 @@ def test_custom_node_pack_name(comfy):
     cases = [
         # V1 and V3 classes that ComfyUI tags with the module it loaded them from.
         (types.SimpleNamespace(RELATIVE_PYTHON_MODULE="custom_nodes.pack"), "pack"),
-        (types.SimpleNamespace(RELATIVE_PYTHON_MODULE="custom_nodes.pack.nodes"), "pack"),
+        # A pack folder's name can contain dots.
+        (
+            types.SimpleNamespace(RELATIVE_PYTHON_MODULE="custom_nodes.ComfyUI-Foo.v2"),
+            "ComfyUI-Foo.v2",
+        ),
         # V3 classes on a ComfyUI that doesn't tag them: __module__ is the file path.
         (types.SimpleNamespace(__module__="/ComfyUI/custom_nodes/my_pack.nodes"), "my_pack"),
         (types.SimpleNamespace(__module__="C:\\ComfyUI\\custom_nodes\\my_pack.nodes"), "my_pack"),
+        # ComfyUI writes a pack folder's dots as _x_ in the module name.
+        (
+            types.SimpleNamespace(__module__="/ComfyUI/custom_nodes/ComfyUI-Foo_x_v2.nodes"),
+            "ComfyUI-Foo.v2",
+        ),
         # A tag that isn't a custom node falls back to the module path.
         (
             types.SimpleNamespace(
@@ -1959,7 +1968,7 @@ def test_jobs_doesnt_upload_custom_nodes_with_attach_custom_nodes_off(comfy, mon
     pack, workflow = _studio_pack(comfy, monkeypatch)
     fake_nodes(
         monkeypatch,
-        {"StudioResize": "custom_nodes.studio-nodes.nodes", "Gone": "custom_nodes.gone"},
+        {"StudioResize": "custom_nodes.studio-nodes", "Gone": "custom_nodes.gone"},
         {"studio-nodes": pack},
     )
     workflow = {**workflow, "6": {"class_type": "Gone", "inputs": {}}}

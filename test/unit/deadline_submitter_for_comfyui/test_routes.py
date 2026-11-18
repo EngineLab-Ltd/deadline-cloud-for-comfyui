@@ -12,6 +12,7 @@ import re
 import shlex
 import sys
 import textwrap
+import time
 import types
 from pathlib import Path
 
@@ -66,6 +67,10 @@ def comfy(monkeypatch, tmp_path):
     )
     monkeypatch.delitem(sys.modules, "deadline.comfyui_submitter.routes", raising=False)
     routes = importlib.import_module("deadline.comfyui_submitter.routes")
+    # Tests read the bundle after submitting, so it's kept. test_submitted_bundles_are_deleted
+    # covers deleting it.
+    remove_bundle = routes._remove_bundle
+    monkeypatch.setattr(routes, "_remove_bundle", lambda bundle_dir: None)
     for var in (
         submit.TEMPLATE_ENV_VAR,
         submit.ALLOW_REMOTE_ENV_VAR,
@@ -75,7 +80,9 @@ def comfy(monkeypatch, tmp_path):
     config = tmp_path / "config.json"
     config.write_text(json.dumps({"conda_channels": "s3://bucket/Conda/Default conda-forge"}))
     monkeypatch.setenv(submit.CONFIG_ENV_VAR, str(config))
-    return types.SimpleNamespace(routes=routes, server=prompt_server, tmp_path=tmp_path)
+    return types.SimpleNamespace(
+        routes=routes, server=prompt_server, tmp_path=tmp_path, remove_bundle=remove_bundle
+    )
 
 
 def fake_cli(
@@ -619,6 +626,7 @@ def test_bundles_are_only_readable_by_their_owner(comfy, monkeypatch, umask_022)
         "template.yaml": 0o600,
         "fox_api.json": 0o600,
         "asset_references.yaml": 0o600,
+        ".deadline-submission": 0o600,
     }
 
 
@@ -1234,3 +1242,80 @@ def test_templates_without_model_directory_dont_attach_local_models(comfy, monke
     assert "m.safetensors won't be attached" in body["warnings"][0]
     assert not (Path(body["job_bundle"]) / "local_models").exists()
     assert "ModelDirectory" not in sent_parameters(requests)
+
+
+@pytest.mark.parametrize(
+    ("responses", "kept"), [([result({"jobId": "job-1"})], False), (["crash"], True)]
+)
+def test_submitted_bundles_are_deleted(comfy, monkeypatch, responses, kept):
+    """A job's bundle, with its models, isn't needed once the job exists. A failed one is kept."""
+    monkeypatch.setattr(comfy.routes, "_remove_bundle", comfy.remove_bundle)
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    checkpoint = _local_checkpoint(comfy)
+    fake_bridge(monkeypatch, comfy.tmp_path, {"submit": responses})
+    status, body = run(call(comfy, "/deadline/jobs", {**JOB, "parameters": {}}))
+    assert status == 202
+    assert Path(body["job_bundle"]).exists() is kept
+    # Deleting the bundle's link to a model leaves the model.
+    assert checkpoint.read_bytes() == b"model"
+
+
+def test_old_submission_bundles_are_deleted_when_comfyui_starts(comfy):
+    """Bundles a submission left behind are deleted after a day, and bundles saved to keep aren't."""
+    submissions = comfy.tmp_path / "user" / "deadline_submissions"
+    marker = comfy.routes.SUBMISSION_MARKER
+    two_days_ago = time.time() - 2 * 24 * 60 * 60
+    for name in ("old", "recent", "saved"):
+        (submissions / name).mkdir(parents=True)
+        (submissions / name / "template.yaml").write_text("x")
+        os.utime(submissions / name / "template.yaml", (two_days_ago, two_days_ago))
+    for name in ("old", "recent"):
+        (submissions / name / marker).write_text("")
+    os.utime(submissions / "old" / marker, (two_days_ago, two_days_ago))
+    comfy.routes._remove_old_submissions(submissions)
+    assert sorted(path.name for path in submissions.iterdir()) == ["recent", "saved"]
+
+
+def test_a_bundle_that_cant_all_be_deleted_is_marked_again(comfy, monkeypatch, caplog):
+    """Such as a file an antivirus has open on Windows. A later sweep tries again."""
+    bundle = comfy.tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / comfy.routes.SUBMISSION_MARKER).write_text("")
+    (bundle / "m.safetensors").write_bytes(b"model")
+
+    def partly(path, ignore_errors=False):
+        (Path(path) / comfy.routes.SUBMISSION_MARKER).unlink()
+
+    monkeypatch.setattr(comfy.routes.shutil, "rmtree", partly)
+    comfy.remove_bundle(bundle)
+    assert (bundle / comfy.routes.SUBMISSION_MARKER).is_file()
+    assert "Couldn't delete all of the job bundle" in caplog.text
+
+
+def test_jobs_mark_the_bundle_before_staging_models(comfy, monkeypatch):
+    """A bundle left by a crash while copying a model is still deleted later."""
+    fake_tools(monkeypatch, comfy.tmp_path)
+    _local_checkpoint(comfy)
+    marked = []
+
+    def fail(models, directories, dest):
+        marked.append((dest.parent / comfy.routes.SUBMISSION_MARKER).is_file())
+        raise OSError("disk full")
+
+    monkeypatch.setattr(comfy.routes, "stage_local_models", fail)
+    status, _ = run(post(comfy, {"workflow": WORKFLOW}))
+    assert status == 202
+    assert marked == [True]
+
+
+def test_jobs_delete_old_bundles_too(comfy, monkeypatch):
+    """A ComfyUI server can run for weeks, so old bundles are deleted on submitting too."""
+    old = comfy.tmp_path / "user" / "deadline_submissions" / "old"
+    old.mkdir(parents=True)
+    (old / comfy.routes.SUBMISSION_MARKER).write_text("")
+    two_days_ago = time.time() - 2 * 24 * 60 * 60
+    os.utime(old / comfy.routes.SUBMISSION_MARKER, (two_days_ago, two_days_ago))
+    fake_tools(monkeypatch, comfy.tmp_path)
+    status, _ = run(post(comfy, {"workflow": WORKFLOW}))
+    assert status == 202
+    assert not old.exists()

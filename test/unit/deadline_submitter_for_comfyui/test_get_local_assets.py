@@ -375,3 +375,18 @@ def test_find_workflow_local_models_searches_every_folder_when_the_hint_misses(t
         {"m.safetensors": path},
         {"m.safetensors": "vae"},
     )
+
+
+def test_stage_local_models_warns_when_it_copies_a_model(comfy, tmp_path, monkeypatch, caplog):
+    """A copy, such as of a model on another drive, takes time and space, so it's logged."""
+    source = touch(comfy["checkpoints"] / "m.safetensors")
+
+    def fail_link(source, target):
+        raise OSError("Invalid cross-device link")
+
+    monkeypatch.setattr("deadline.comfyui_submitter.get_local_assets.os.link", fail_link)
+    dest = tmp_path / "local_models"
+    staged = stage_local_models({"m.safetensors": source}, {"m.safetensors": "checkpoints"}, dest)
+    assert staged == {"m.safetensors": dest / "checkpoints" / "m.safetensors"}
+    assert "Copying model 'm.safetensors' into the job bundle" in caplog.text
+    assert "Invalid cross-device link" in caplog.text

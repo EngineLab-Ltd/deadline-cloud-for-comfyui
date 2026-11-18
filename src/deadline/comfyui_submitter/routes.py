@@ -13,6 +13,9 @@ import ipaddress
 import json
 import logging
 import re
+import shutil
+import threading
+import time
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -50,6 +53,7 @@ from .submit import (
     template_defines_parameter,
     validate_api_workflow,
     workflow_models,
+    write_private_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,6 +73,11 @@ LOGIN_TIMEOUT = 600
 # A confirmation nobody answers, for example after its tab closed, is declined after this long, so
 # the submission ends instead of waiting forever.
 CONFIRM_TIMEOUT = 600
+# A bundle made for a submission holds this file. The bundle is deleted when its submission is
+# done, or if that didn't happen, such as when ComfyUI stopped, when ComfyUI next starts after a
+# day. Bundles saved to keep don't have it.
+SUBMISSION_MARKER = ".deadline-submission"
+OLD_SUBMISSION_AGE = 24 * 60 * 60
 # The queue environment parameter that the config's conda_channels fills in.
 CONDA_CHANNELS_PARAMETER = "CondaChannels"
 
@@ -89,6 +98,8 @@ class _Submission:
     answered: int = 0
     # Timers that decline unanswered confirmations, canceled when the submission ends.
     timers: list[asyncio.Task] = field(default_factory=list)
+    # The job bundle, deleted once the job is created or the submission is canceled.
+    bundle_dir: Path | None = None
 
 
 _submissions: dict[str, _Submission] = {}
@@ -376,6 +387,49 @@ def _save_asset_references(
         logger.exception("Couldn't save asset_references.yaml")
 
 
+def _submissions_dir() -> Path:
+    return Path(folder_paths.get_user_directory()) / "deadline_submissions"
+
+
+def _remove_bundle(bundle_dir: Path | None) -> None:
+    """
+    Deletes a submission's job bundle, with its copies of models. Deadline Cloud has the job, and
+    job attachments has its files, so the bundle isn't needed.
+    """
+    if bundle_dir is not None and (bundle_dir / SUBMISSION_MARKER).is_file():
+        _delete_bundle(bundle_dir)
+
+
+def _delete_bundle(bundle_dir: Path) -> None:
+    """
+    Deletes a marked bundle. What can't be deleted, such as a file another program has open, is
+    marked again, so a later sweep tries again.
+    """
+    shutil.rmtree(bundle_dir, ignore_errors=True)
+    if bundle_dir.exists():
+        logger.warning("Couldn't delete all of the job bundle %s", _log_value(bundle_dir))
+        try:
+            write_private_text(bundle_dir / SUBMISSION_MARKER, "")
+        except OSError:
+            logger.warning("Couldn't mark %s to delete later", _log_value(bundle_dir))
+
+
+def _remove_old_submissions(submissions_dir: Path, age: float = OLD_SUBMISSION_AGE) -> None:
+    """Deletes submissions' bundles older than age seconds, such as from a failed submission."""
+    cutoff = time.time() - age
+    try:
+        bundles = list(submissions_dir.iterdir())
+    except OSError:
+        return
+    for bundle_dir in bundles:
+        try:
+            marker = bundle_dir / SUBMISSION_MARKER
+            if marker.is_file() and marker.stat().st_mtime < cutoff:
+                _delete_bundle(bundle_dir)
+        except OSError:
+            logger.warning("Couldn't delete the old job bundle %s", _log_value(bundle_dir))
+
+
 def _start(coroutine) -> None:
     task = asyncio.create_task(coroutine)
     _watchers.add(task)
@@ -564,9 +618,16 @@ class _Bundle:
 
 
 async def _build_bundle(
-    body: dict[str, Any], workflow: dict[str, Any], template: Path, config: dict[str, Any]
+    body: dict[str, Any],
+    workflow: dict[str, Any],
+    template: Path,
+    config: dict[str, Any],
+    submission: bool = True,
 ) -> _Bundle:
-    """Creates the job bundle from the panel's values. Raises SubmitError."""
+    """
+    Creates the job bundle from the panel's values. A bundle for a submission is marked, to delete
+    when the submission is done. Raises SubmitError.
+    """
     parameters = _string_map(body.get("parameters"), "parameters")
     assets = _attachments(body.get("attachments"))
     excluded_models = _model_names(body.get("excludedModels"))
@@ -581,9 +642,16 @@ async def _build_bundle(
         template,
         workflow,
         _workflow_name(body),
-        Path(folder_paths.get_user_directory()) / "deadline_submissions",
+        _submissions_dir(),
         description=description,
     )
+    # Marked before the models are staged, so a bundle left by a crash while copying them is
+    # still deleted.
+    if submission:
+        try:
+            write_private_text(bundle_dir / SUBMISSION_MARKER, "")
+        except OSError:
+            logger.warning("Couldn't mark %s to delete after submitting", _log_value(bundle_dir))
     _exclude_local_models(prepared, excluded_models, workflow)
     # Copying models can take a while when the bundle is on another volume.
     staged = await asyncio.to_thread(_stage_prepared, prepared, workflow, bundle_dir)
@@ -625,6 +693,8 @@ async def submit_job(request: web.Request) -> web.Response:
         bundle = await _build_bundle(body, workflow, template, config)
     except SubmitError as e:
         return _error(400, str(e))
+    # A server that runs for weeks also deletes old bundles, not only when ComfyUI starts.
+    _start(asyncio.to_thread(_remove_old_submissions, _submissions_dir()))
 
     settings.setdefault("name", f"ComfyUI - {name}")
     submission = {
@@ -655,7 +725,7 @@ async def submit_job(request: web.Request) -> web.Response:
     else:
         submission_id = uuid.uuid4().hex
     _submissions[submission_id] = _Submission(
-        str(settings["name"]), process, client_id=_client_id(body)
+        str(settings["name"]), process, client_id=_client_id(body), bundle_dir=bundle.bundle_dir
     )
     logger.info(
         "Submitting %s to Deadline Cloud from %s",
@@ -721,9 +791,12 @@ async def _watch_submission(submission_id: str) -> None:
             _log_value(result["jobId"]),
         )
         _send(SUBMITTED_EVENT, {**base, **result, "status": "SUBMITTED"}, submission.client_id)
+        await asyncio.to_thread(_remove_bundle, submission.bundle_dir)
     elif submission.canceled:
         _send(SUBMITTED_EVENT, {**base, "status": "CANCELED"}, submission.client_id)
+        await asyncio.to_thread(_remove_bundle, submission.bundle_dir)
     else:
+        # A failed submission's bundle is kept for a day, to look into or submit again.
         error = _bridge_failure(events, stderr, process.returncode)
         logger.error(
             "Couldn't submit %s to Deadline Cloud: %s",
@@ -834,3 +907,11 @@ async def choose_paths(request: web.Request) -> web.Response:
     if process.returncode != 0:
         paths = []
     return web.json_response({"paths": [str(Path(path)) for path in paths if path]})
+
+
+# Deletes old bundles in the background, so ComfyUI's start doesn't wait on slow storage.
+threading.Thread(
+    target=lambda: _remove_old_submissions(_submissions_dir()),
+    name="deadline-old-submissions",
+    daemon=True,
+).start()

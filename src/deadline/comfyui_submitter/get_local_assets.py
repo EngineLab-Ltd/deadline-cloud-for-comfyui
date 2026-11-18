@@ -173,7 +173,14 @@ def stage_local_models(
             if not target.exists():
                 try:
                     os.link(source, target)
-                except OSError:
+                except OSError as e:
+                    # Such as a model on another drive. The copy is deleted with the bundle.
+                    logger.warning(
+                        "Copying model %r into the job bundle, since it can't be linked from %s: %s",
+                        name,
+                        source,
+                        e,
+                    )
                     shutil.copy2(source, target)
         except OSError:
             logger.exception("Couldn't stage model %r from %s", name, source)

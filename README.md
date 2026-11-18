@@ -28,8 +28,9 @@ When you submit, the extension:
 1. Converts the open workflow to API format, the same as **Workflow > Export (API)**.
 2. Creates a job bundle for the submission in
    `ComfyUI/user/deadline_submissions/<timestamp>_<workflow>/`, with a copy of the
-   [job template](#the-job) and the workflow as `<workflow>_api.json`. That folder is a record of
-   every workflow you submitted.
+   [job template](#the-job) and the workflow as `<workflow>_api.json`. The bundle is deleted once
+   the job is created, or when you cancel. A failed submission's bundle is kept for a day, to look
+   into or submit again.
 3. Submits the job bundle with the Deadline Cloud library, with these parameters filled in. The
    panel shows them, and anything you change there wins:
 
@@ -211,8 +212,9 @@ the same machine.
   On Linux and macOS that folder and each bundle in it can only be opened by the user that runs
   ComfyUI (mode `0700`), and the files the extension writes there can only be read by that user
   (`0600`), whatever the umask. Models staged in a bundle are often links to your files, so
-  their permissions stay as they are, but they can only be reached through the bundle. On Windows, bundles inherit the permissions of the ComfyUI user folder. The
-  `deadline_cloud_submitter.json` config file is also `0600`.
+  their permissions stay as they are, but they can only be reached through the bundle, which is
+  deleted once its job is created. On Windows, bundles inherit the permissions of the ComfyUI
+  user folder. The `deadline_cloud_submitter.json` config file is also `0600`.
 
 **Sharing a server.** `COMFYUI_DEADLINE_ALLOW_REMOTE=1` turns off the local-only check, including
 for requests through a proxy. Only set it when every person who can reach ComfyUI may submit with

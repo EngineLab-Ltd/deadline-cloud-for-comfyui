@@ -395,13 +395,24 @@ def _model_directory(
     )
 
 
+# Folder names ComfyUI still accepts from older workflows, as its folder_paths.map_legacy does.
+_LEGACY_FOLDERS = {"clip": "text_encoders", "unet": "diffusion_models"}
+
+
 def _search_local_model(
     folders: ModelFolders, name: str, directory: str | None
 ) -> tuple[Path, str] | None:
-    """The local file and the folder it was found in, or None when it is missing."""
-    if directory:
-        path = find_local_model(folders, directory, name)
-        return (path, directory) if path is not None else None
+    """
+    The local file and the folder it was found in, or None when it is missing. The folder the
+    workflow names is searched first. It can be a legacy name, or a guess from a subgraph, so the
+    other folders are searched when it doesn't have the file.
+    """
+    if directory and directory not in folders:
+        directory = _LEGACY_FOLDERS.get(directory, directory)
+    for folder_name in [directory] if directory else []:
+        path = find_local_model(folders, folder_name, name)
+        if path is not None:
+            return path, folder_name
     for folder_name in folders:
         path = find_local_model(folders, folder_name, name)
         if path is not None:

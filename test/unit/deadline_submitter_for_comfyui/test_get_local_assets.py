@@ -341,3 +341,37 @@ def test_find_workflow_local_models_searches_registered_folders_without_a_direct
     found, directories = find_workflow_local_models(ui, api, folders)
     assert found == {"other.ckpt": other, "style.pt": path}
     assert directories == {"other.ckpt": "checkpoints", "style.pt": "loras"}
+
+
+@pytest.mark.parametrize(
+    ("hint", "folder"), [("clip", "text_encoders"), ("unet", "diffusion_models")]
+)
+def test_find_workflow_local_models_maps_legacy_folder_names(tmp_path, hint, folder):
+    """ComfyUI loads clip and unet models from text_encoders and diffusion_models."""
+    path = touch(tmp_path / folder / "m.safetensors")
+    folders = {folder: ([str(path.parent)], set[str]())}
+    ui = {"nodes": [{"properties": {"models": [{"directory": hint, "name": "m.safetensors"}]}}]}
+    api = {"1": {"inputs": {"clip_name": "m.safetensors"}}}
+    assert find_workflow_local_models(ui, api, folders) == (
+        {"m.safetensors": path},
+        {"m.safetensors": folder},
+    )
+
+
+def test_find_workflow_local_models_searches_every_folder_when_the_hint_misses(tmp_path):
+    """A wrong folder hint, such as one guessed from a subgraph, doesn't hide a local model."""
+    path = touch(tmp_path / "vae" / "m.safetensors")
+    folders = {
+        "checkpoints": ([str(tmp_path / "checkpoints")], set[str]()),
+        "vae": ([str(path.parent)], set[str]()),
+    }
+    ui = {
+        "nodes": [
+            {"properties": {"models": [{"directory": "checkpoints", "name": "m.safetensors"}]}}
+        ]
+    }
+    api = {"1": {"inputs": {"vae_name": "m.safetensors"}}}
+    assert find_workflow_local_models(ui, api, folders) == (
+        {"m.safetensors": path},
+        {"m.safetensors": "vae"},
+    )

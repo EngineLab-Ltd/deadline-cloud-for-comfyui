@@ -253,13 +253,11 @@ jobEnvironments:
             python -m venv --system-site-packages "$VENV" \
                 || { echo "openjd_fail: Couldn't create a virtual environment for the custom nodes"; exit 1; }
             export VIRTUAL_ENV="$VENV" PATH="$VENV/bin:$PATH"
-            # The comfy package records its pip packages at build time, because the conda
-            # environment has no pip of its own. The virtual environment's pip is the fallback.
-            if [ -f "$COMFYUI_LOCATION/pip-freeze.txt" ]; then
-                grep -v ' @ ' "$COMFYUI_LOCATION/pip-freeze.txt" > '{{Session.WorkingDirectory}}/constraints.txt'
-            else
-                "$VENV/bin/python" -m pip freeze | grep -v ' @ ' > '{{Session.WorkingDirectory}}/constraints.txt'
-            fi
+            # Pins every package the conda environment has. pip freeze writes the ones conda
+            # installed as "name @ file:///...", which a constraints file can't hold, so they'd
+            # go unpinned. pip list writes every package as name==version.
+            "$VENV/bin/python" -m pip list --format=freeze > '{{Session.WorkingDirectory}}/constraints.txt' \
+                || { echo "openjd_fail: Couldn't list the conda environment's packages"; exit 1; }
             export PIP_CONSTRAINT='{{Session.WorkingDirectory}}/constraints.txt'
             for NODE_DIR in "${ATTACHED_NODES[@]}"; do
                 if [ -f "$NODE_DIR/requirements.txt" ]; then

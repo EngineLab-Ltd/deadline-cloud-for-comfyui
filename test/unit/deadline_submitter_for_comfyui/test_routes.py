@@ -2037,3 +2037,33 @@ def test_jobs_use_the_templates_attach_custom_nodes_default(comfy, monkeypatch):
     status, response = run(call(comfy, "/deadline/jobs", {**JOB, "workflow": workflow}))
     assert status == 202, response
     assert _staged_node_packs(response) == []
+
+
+@pytest.mark.parametrize(
+    ("parameters", "error"),
+    [
+        ({"AttachCustomNodes": "garbage"}, "Attach Custom Nodes must be true or false"),
+        ({"AttachCustomNodes": ""}, "Attach Custom Nodes must be true or false"),
+        ({"AttachCustomNodes": 2}, "Attach Custom Nodes must be true or false"),
+        ({"WorkflowTimeout": "soon"}, "must be a whole number, not 'soon'"),
+        ({"WorkflowTimeout": "30"}, "must be at least 60, not '30'"),
+    ],
+)
+@pytest.mark.parametrize("route", ["/deadline/jobs", "/deadline/bundle"])
+def test_bad_parameter_values_are_refused_before_anything_is_staged(
+    comfy, monkeypatch, parameters, error, route
+):
+    """Deadline Cloud would refuse them too, after the models and packs were copied."""
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    _, workflow = _studio_pack(comfy, monkeypatch)
+    requests = fake_bridge(monkeypatch, comfy.tmp_path, {})
+    staged = []
+    monkeypatch.setattr(comfy.routes, "_stage_prepared", lambda *args: staged.append(args))
+    status, response = run(
+        call(comfy, route, {**JOB, "workflow": workflow, "parameters": parameters})
+    )
+    assert status == 400
+    assert error in response["error"]
+    assert staged == []
+    assert not requests.exists()
+    assert not (comfy.tmp_path / "user" / "deadline_submissions").exists()

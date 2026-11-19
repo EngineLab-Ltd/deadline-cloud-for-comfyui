@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -527,6 +528,7 @@ def host_requirements(value: Any) -> dict[str, Any] | None:
 # The spellings OpenJD takes for a BOOL job parameter, in any case.
 _TRUE_VALUES = frozenset({"true", "yes", "on", "1"})
 _FALSE_VALUES = frozenset({"false", "no", "off", "0"})
+_INT_VALUE = re.compile(r"[+-]?\d+")
 
 
 def parse_bool(value: Any) -> bool | None:
@@ -541,6 +543,71 @@ def parse_bool(value: Any) -> bool | None:
     if text in _FALSE_VALUES:
         return False
     return None
+
+
+def _number(value: Any, kind: str) -> int | float | None:
+    """An INT or FLOAT job parameter's value, or None when OpenJD would refuse it."""
+    if isinstance(value, bool):
+        return None
+    if kind == "INT":
+        if isinstance(value, int):
+            return value
+        text = str(value).strip()
+        return int(text) if _INT_VALUE.fullmatch(text) else None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def check_parameter_values(
+    definitions: list[dict[str, Any]], parameters: Mapping[str, Any]
+) -> None:
+    """
+    Checks the values of the job template's BOOL, INT, FLOAT and STRING parameters as Deadline
+    Cloud would, so a bad one is refused before the bundle is created and files are copied for
+    it. Parameters the template doesn't define, such as the queue's, are left to the library.
+    Raises SubmitError.
+    """
+    for definition in definitions:
+        if not isinstance(definition, dict) or definition.get("name") not in parameters:
+            continue
+        name = definition["name"]
+        value = parameters[name]
+        kind = definition.get("type")
+        label = (definition.get("userInterface") or {}).get("label") or name
+        checked: Any = value
+        if kind == "BOOL":
+            if parse_bool(value) is None:
+                raise SubmitError(f"{label} must be true or false, not {value!r}.")
+            continue
+        if kind in ("INT", "FLOAT"):
+            checked = _number(value, kind)
+            if checked is None:
+                what = "a whole number" if kind == "INT" else "a number"
+                raise SubmitError(f"{label} must be {what}, not {value!r}.")
+            low = _number(definition.get("minValue"), kind)
+            high = _number(definition.get("maxValue"), kind)
+            if low is not None and checked < low:
+                raise SubmitError(f"{label} must be at least {low}, not {value!r}.")
+            if high is not None and checked > high:
+                raise SubmitError(f"{label} must be at most {high}, not {value!r}.")
+        elif kind == "STRING":
+            checked = str(value)
+            shortest, longest = definition.get("minLength"), definition.get("maxLength")
+            if shortest is not None and len(checked) < int(shortest):
+                raise SubmitError(f"{label} must be at least {shortest} characters long.")
+            if longest is not None and len(checked) > int(longest):
+                raise SubmitError(f"{label} must be at most {longest} characters long.")
+        else:
+            continue
+        allowed = definition.get("allowedValues")
+        if allowed and checked not in [
+            _number(item, kind) if kind != "STRING" else str(item) for item in allowed
+        ]:
+            choices = ", ".join(str(item) for item in allowed)
+            raise SubmitError(f"{label} must be one of {choices}, not {value!r}.")
 
 
 def job_description(value: Any) -> str | None:

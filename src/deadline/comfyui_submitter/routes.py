@@ -43,6 +43,7 @@ from .submit import (
     PICKER_KINDS,
     SubmitError,
     check_cli_version,
+    check_parameter_values,
     create_job_bundle,
     host_requirements,
     input_folders,
@@ -839,6 +840,8 @@ async def _build_bundle(
     requirements = host_requirements(body.get("hostRequirements"))
     description = job_description(body.get("description"))
     definitions = read_job_template(template).get("parameterDefinitions") or []
+    # Refused before anything is prepared, staged or copied for the job.
+    check_parameter_values(definitions, parameters)
 
     prepared = await asyncio.to_thread(_prepare, body, workflow, template, config)
     defined = {parameter.get("name") for parameter in definitions if isinstance(parameter, dict)}

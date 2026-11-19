@@ -2000,3 +2000,40 @@ def test_jobs_warns_when_a_planned_custom_node_pack_cant_be_staged(comfy, monkey
     assert status == 202
     assert any("StudioResize" in warning for warning in response["warnings"])
     assert "CustomNodesDirectory" not in bridge_requests(requests)[0]["request"]["parameters"]
+
+
+def _staged_node_packs(response: dict) -> list[str]:
+    bundle = Path(response["job_bundle"])
+    references = yaml.safe_load((bundle / "asset_references.yaml").read_text())
+    directories = references["assetReferences"]["inputs"]["directories"]
+    assert (bundle / "local_nodes").exists() is bool(directories)
+    return directories
+
+
+@pytest.mark.parametrize("value", ["no", "OFF", "0", 0, " False "])
+def test_jobs_read_attach_custom_nodes_as_openjd_does(comfy, monkeypatch, value):
+    """OpenJD reads each of these as false, so the job wouldn't load the packs."""
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    _, workflow = _studio_pack(comfy, monkeypatch)
+    fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [result({"jobId": "job-1"})]})
+    body = {**JOB, "workflow": workflow, "parameters": {"AttachCustomNodes": value}}
+    status, response = run(call(comfy, "/deadline/jobs", body))
+    assert status == 202, response
+    assert _staged_node_packs(response) == []
+
+
+def test_jobs_use_the_templates_attach_custom_nodes_default(comfy, monkeypatch):
+    """A studio template can turn the switch off by default, and a request can leave it out."""
+    template = yaml.safe_load(submit.JOB_TEMPLATE.read_text())
+    for parameter in template["parameterDefinitions"]:
+        if parameter["name"] == "AttachCustomNodes":
+            parameter["default"] = "no"
+    studio = comfy.tmp_path / "studio.yaml"
+    studio.write_text(yaml.safe_dump(template, sort_keys=False))
+    monkeypatch.setenv(submit.TEMPLATE_ENV_VAR, str(studio))
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    _, workflow = _studio_pack(comfy, monkeypatch)
+    fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [result({"jobId": "job-1"})]})
+    status, response = run(call(comfy, "/deadline/jobs", {**JOB, "workflow": workflow}))
+    assert status == 202, response
+    assert _staged_node_packs(response) == []

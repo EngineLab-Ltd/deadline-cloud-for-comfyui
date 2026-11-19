@@ -524,6 +524,25 @@ def host_requirements(value: Any) -> dict[str, Any] | None:
     return result
 
 
+# The spellings OpenJD takes for a BOOL job parameter, in any case.
+_TRUE_VALUES = frozenset({"true", "yes", "on", "1"})
+_FALSE_VALUES = frozenset({"false", "no", "off", "0"})
+
+
+def parse_bool(value: Any) -> bool | None:
+    """A BOOL job parameter's value as OpenJD reads it, or None when OpenJD would refuse it."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return {0: False, 1: True}.get(value)
+    text = str(value).strip().lower()
+    if text in _TRUE_VALUES:
+        return True
+    if text in _FALSE_VALUES:
+        return False
+    return None
+
+
 def job_description(value: Any) -> str | None:
     """Checks the panel's job description. Empty keeps the job template's. Raises SubmitError."""
     if value is None or value == "":

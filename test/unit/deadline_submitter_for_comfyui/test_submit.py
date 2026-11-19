@@ -564,3 +564,13 @@ def test_picker_command_on_linux(monkeypatch):
     assert "--multiple" in (submit.picker_command("files", "linux") or [])
     monkeypatch.setattr(submit.shutil, "which", lambda name: None)
     assert submit.picker_command("files", "linux") is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(True, True), ("true", True), ("Yes", True), (" ON ", True), ("1", True), (1, True)]
+    + [(False, False), ("FALSE", False), ("no", False), ("off", False), ("0", False), (0, False)]
+    + [("", None), ("garbage", None), (2, None), ("1.0", None), (None, None)],
+)
+def test_parse_bool_reads_bool_parameters_as_openjd_does(value, expected):
+    assert submit.parse_bool(value) is expected

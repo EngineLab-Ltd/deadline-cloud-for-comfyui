@@ -49,6 +49,7 @@ from .submit import (
     job_description,
     load_config,
     local_node_packs,
+    parse_bool,
     picker_command,
     read_job_template,
     remote_allowed,
@@ -68,6 +69,8 @@ logger = logging.getLogger(__name__)
 SUBMITTED_EVENT = "deadline.submitted"
 PROGRESS_EVENT = "deadline.progress"
 CONFIRM_EVENT = "deadline.confirm"
+# The job template's switch for loading the attached custom node packs on the worker.
+ATTACH_NODES = "AttachCustomNodes"
 DOWNLOAD_EVENT = "deadline.download"
 # A farm, queue or job ID, which goes on the CLI's command line.
 _RESOURCE_ID = re.compile(r"(farm|queue|job)-[0-9a-f]{32}")
@@ -806,6 +809,19 @@ class _Bundle:
     warnings: list[str]
 
 
+def _attaches_nodes(definitions: list[Any], parameters: dict[str, Any]) -> bool:
+    """
+    Whether the job loads the attached custom node packs: the panel's Attach Custom Nodes, or the
+    job template's default, read as OpenJD reads a BOOL. A template without it attaches them.
+    """
+    definition = next(
+        (d for d in definitions if isinstance(d, dict) and d.get("name") == ATTACH_NODES),
+        {},
+    )
+    value = parameters.get(ATTACH_NODES, definition.get("default", True))
+    return parse_bool(value) is not False
+
+
 async def _build_bundle(
     body: dict[str, Any],
     workflow: dict[str, Any],
@@ -822,12 +838,10 @@ async def _build_bundle(
     excluded_models = _model_ids(body.get("excludedModels"))
     requirements = host_requirements(body.get("hostRequirements"))
     description = job_description(body.get("description"))
+    definitions = read_job_template(template).get("parameterDefinitions") or []
 
     prepared = await asyncio.to_thread(_prepare, body, workflow, template, config)
-    defined = {
-        parameter.get("name")
-        for parameter in read_job_template(template).get("parameterDefinitions", [])
-    }
+    defined = {parameter.get("name") for parameter in definitions if isinstance(parameter, dict)}
     bundle_dir, workflow_path = create_job_bundle(
         template,
         workflow,
@@ -845,7 +859,7 @@ async def _build_bundle(
             logger.warning("Couldn't mark %s to delete after submitting", _log_value(bundle_dir))
     _exclude_local_models(prepared, excluded_models, workflow)
     # The job ignores attached packs with Attach Custom Nodes off, so they aren't uploaded.
-    attach_nodes = str(parameters.get("AttachCustomNodes", "true")).lower() != "false"
+    attach_nodes = _attaches_nodes(definitions, parameters)
     # Copying models and custom nodes can take a while when the bundle is on another volume.
     staged = await asyncio.to_thread(_stage_prepared, prepared, workflow, bundle_dir, attach_nodes)
     await asyncio.to_thread(

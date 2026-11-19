@@ -580,10 +580,23 @@ function parameterValue(parameter: Parameter): ParameterValue {
   return filled ?? parameter.default ?? "";
 }
 
+// A BOOL job parameter's value as OpenJD reads it, or null when OpenJD would refuse it. The
+// submitter reads it the same way.
+export function parseBool(value: ParameterValue): boolean | null {
+  const text = String(value).trim().toLowerCase();
+  if (["true", "yes", "on", "1"].includes(text)) {
+    return true;
+  }
+  if (["false", "no", "off", "0"].includes(text)) {
+    return false;
+  }
+  return null;
+}
+
 // Templates without the switch don't list any custom nodes.
 function attachesNodes() {
   const parameter = state.plan?.parameters.find(({ name }) => name === ATTACH_NODES_PARAMETER);
-  return !parameter || String(parameterValue(parameter)).toLowerCase() !== "false";
+  return !parameter || parseBool(parameterValue(parameter)) !== false;
 }
 
 // What a queue parameter is without the artist's edit: the submitter's configured value, then the
@@ -1217,7 +1230,7 @@ function parameterControl(
   if (control === "CHECK_BOX") {
     return h("input", {
       type: "checkbox",
-      checked: String(value).toLowerCase() === "true",
+      checked: parseBool(value) === true,
       onChange: (event: Event) => onChange(inputChecked(event) ? "true" : "false"),
     });
   }

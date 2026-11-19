@@ -1,6 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 import os
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -609,12 +610,14 @@ def test_stage_local_node_packs_keeps_links_inside_the_pack_only(comfy, tmp_path
     assert "it links to a folder that holds it" in caplog.text
 
 
-@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="Named pipes are POSIX only.")
+@pytest.mark.skipif(sys.platform == "win32", reason="Named pipes are POSIX only.")
 def test_stage_local_node_packs_leaves_out_special_files(comfy, tmp_path, caplog):
     """Copying a named pipe would wait for a writer forever."""
     pack = comfy["custom_nodes"] / "pipe-nodes"
     touch(pack / "__init__.py")
-    os.mkfifo(pack / "events")
+    # Windows has no os.mkfifo, and mypy checks this file for Windows too.
+    if sys.platform != "win32":
+        os.mkfifo(pack / "events")
     dest = tmp_path / "local_nodes"
     stage_local_node_packs({"pipe-nodes": pack}, dest)
     assert _staged_files(dest, "pipe-nodes") == ["__init__.py"]

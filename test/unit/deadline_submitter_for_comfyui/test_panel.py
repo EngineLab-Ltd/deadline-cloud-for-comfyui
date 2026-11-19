@@ -184,3 +184,20 @@ def test_host_requirement_values_without_a_checkbox_are_kept(run_scenario):
         ],
         "amounts": [{"name": "amount.worker.gpu", "min": 1}],
     }
+
+
+def test_a_submitted_job_remembers_where_its_outputs_download_to(run_scenario):
+    assert run_scenario("submitted-output-dir")["outputDir"] == "/comfy/output"
+
+
+@pytest.mark.parametrize(
+    ("scenario", "destination"),
+    [
+        ("downloaded-to-cli-folder", "to /comfy/output/fox"),
+        ("downloaded-to-submitted-folder", "to /comfy/output"),
+        # A job saved by an older panel has no folder.
+        ("downloaded-to-unknown", "into the output directory it was submitted with"),
+    ],
+)
+def test_a_finished_download_says_where_the_files_are(run_scenario, scenario, destination):
+    assert run_scenario(scenario)["toasts"] == [f"Downloaded 2 files from fox {destination}."]

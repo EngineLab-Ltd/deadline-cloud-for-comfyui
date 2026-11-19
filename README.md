@@ -21,7 +21,7 @@ GPU workers, with the models and input files it uses attached to the job.
   - the input files and folders, and the models, to attach, which you can remove, or add to with a
     file dialog on the ComfyUI machine
   - upload progress, the status of your recent jobs, and **Download** for their outputs, which
-    go back into the output directory they were submitted with
+    go back into the output directory they were submitted with. Each job shows that directory.
   - **Save job bundle**, which creates the job bundle without submitting it, to submit later with
     `deadline bundle submit`. The bundle keeps the parameters, host requirements, priority,
     initial state, and the failed task, retry and worker limits. Pass the job name with `--name`.

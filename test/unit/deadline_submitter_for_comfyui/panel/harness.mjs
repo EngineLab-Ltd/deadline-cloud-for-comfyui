@@ -224,6 +224,25 @@ if (scenario === "edited-before-replanning") {
   const message = "There are no output files available for download at this moment.";
   api.emit("deadline.download", { jobId: "job-1", status: "DOWNLOADED", message, fileCount: 0 });
   result.toasts = app.toasts.map(({ severity, detail }) => ({ severity, detail }));
+} else if (scenario === "submitted-output-dir") {
+  api.emit("deadline.submitted", {
+    submissionId: "s-1",
+    status: "SUBMITTED",
+    name: "fox",
+    jobId: "job-1",
+    farmId: "farm-1",
+    queueId: "queue-1",
+    outputDir: "/comfy/output",
+  });
+  result.outputDir = state.jobs[0].outputDir;
+} else if (scenario.startsWith("downloaded-to-")) {
+  // The CLI's folder wins. Without one, the folder the job was submitted with is named.
+  const job = { jobId: "job-1", name: "fox", farmId: "farm-1", queueId: "queue-1", submittedAt: "" };
+  state.jobs = [scenario === "downloaded-to-unknown" ? job : { ...job, outputDir: "/comfy/output" }];
+  const directory = scenario === "downloaded-to-cli-folder" ? "/comfy/output/fox" : undefined;
+  const message = "Downloaded 2 files";
+  api.emit("deadline.download", { jobId: "job-1", status: "DOWNLOADED", message, fileCount: 2, directory });
+  result.toasts = app.toasts.map(({ detail }) => detail);
 }
 console.log(JSON.stringify(result));
 process.exit(0);

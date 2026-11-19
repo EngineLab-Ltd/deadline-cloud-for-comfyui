@@ -556,7 +556,16 @@ def test_jobs_submits_with_the_library(comfy, monkeypatch):
         "deadline.confirm",
         {**submission, "message": "Upload?", "default": True},
     )
-    assert events[2] == ("deadline.submitted", {**submission, **submitted, "status": "SUBMITTED"})
+    # The panel shows each job's output directory, where Download puts its outputs.
+    assert events[2] == (
+        "deadline.submitted",
+        {
+            **submission,
+            **submitted,
+            "status": "SUBMITTED",
+            "outputDir": str(comfy.tmp_path / "output"),
+        },
+    )
     assert comfy.routes._submissions == {}
 
 
@@ -1517,6 +1526,28 @@ def test_download_runs_the_cli_and_reports_progress(comfy, monkeypatch):
             },
         ),
     ]
+
+
+def test_download_says_which_folder_it_downloaded_into(comfy, monkeypatch):
+    output = comfy.tmp_path / "output"
+    files = [str(output / "fox" / "fox_00001_.png"), str(output / "fox_00002_.png")]
+    summary = {"messageType": "summary", "value": "Downloaded 2 files", "fileCount": 2}
+    fake_cli(monkeypatch, comfy.tmp_path, json.dumps({**summary, "files": files}))
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID}
+    run(call(comfy, "/deadline/jobs/download", body))
+    assert comfy.server.events[-1][1]["directory"] == str(output)
+
+
+@pytest.mark.parametrize("files", [None, [], ["a.png", 5], "a.png"])
+def test_download_leaves_out_a_folder_it_cant_tell(comfy, monkeypatch, files):
+    summary = {"messageType": "summary", "value": "Downloaded 1 file", "fileCount": 1}
+    if files is not None:
+        summary["files"] = files
+    fake_cli(monkeypatch, comfy.tmp_path, json.dumps(summary))
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID}
+    run(call(comfy, "/deadline/jobs/download", body))
+    assert comfy.server.events[-1][1]["status"] == "DOWNLOADED"
+    assert "directory" not in comfy.server.events[-1][1]
 
 
 def test_download_reads_stderr_while_waiting_for_the_summary(comfy, monkeypatch):

@@ -12,6 +12,7 @@ import asyncio
 import ipaddress
 import json
 import logging
+import os
 import re
 import shutil
 import threading
@@ -120,6 +121,8 @@ class _Submission:
     timers: list[asyncio.Task] = field(default_factory=list)
     # The job bundle, deleted once the job is created or the submission is canceled.
     bundle_dir: Path | None = None
+    # Where the job's outputs download to, shown with the job in the panel.
+    output_dir: str | None = None
 
 
 _submissions: dict[str, _Submission] = {}
@@ -791,7 +794,11 @@ async def submit_job(request: web.Request) -> web.Response:
     else:
         submission_id = uuid.uuid4().hex
     _submissions[submission_id] = _Submission(
-        str(settings["name"]), process, client_id=_client_id(body), bundle_dir=bundle.bundle_dir
+        str(settings["name"]),
+        process,
+        client_id=_client_id(body),
+        bundle_dir=bundle.bundle_dir,
+        output_dir=_output_dir(bundle.values),
     )
     logger.info(
         "Submitting %s to Deadline Cloud from %s",
@@ -856,7 +863,10 @@ async def _watch_submission(submission_id: str) -> None:
             _log_value(submission.name),
             _log_value(result["jobId"]),
         )
-        _send(SUBMITTED_EVENT, {**base, **result, "status": "SUBMITTED"}, submission.client_id)
+        submitted = {**base, **result, "status": "SUBMITTED"}
+        if submission.output_dir:
+            submitted["outputDir"] = submission.output_dir
+        _send(SUBMITTED_EVENT, submitted, submission.client_id)
         await asyncio.to_thread(_remove_bundle, submission.bundle_dir)
     elif submission.canceled:
         _send(SUBMITTED_EVENT, {**base, "status": "CANCELED"}, submission.client_id)
@@ -870,6 +880,23 @@ async def _watch_submission(submission_id: str) -> None:
             _log_block(str(error)),
         )
         _send(SUBMITTED_EVENT, {**base, "status": "FAILED", "error": error}, submission.client_id)
+
+
+def _output_dir(values: dict[str, Any]) -> str | None:
+    """The OutputDir a job is submitted with. The CLI downloads the job's outputs there."""
+    value = values.get("OutputDir")
+    return str(value) if value else None
+
+
+def _download_directory(files: Any) -> str | None:
+    """The folder that holds every file the CLI downloaded, from its summary's list of files."""
+    if not isinstance(files, list) or not files or not all(isinstance(f, str) for f in files):
+        return None
+    try:
+        return os.path.commonpath([os.path.dirname(f) for f in files])
+    except ValueError:
+        # Files on different Windows drives have no folder in common.
+        return None
 
 
 async def _write_line(process: asyncio.subprocess.Process, data: dict[str, Any]) -> bool:
@@ -1072,16 +1099,16 @@ async def _watch_download(
     finally:
         stderr_task.cancel()
     if process.returncode == 0 and summary is not None:
-        _send(
-            DOWNLOAD_EVENT,
-            {
-                "jobId": job_id,
-                "status": "DOWNLOADED",
-                "message": str(summary.get("value")),
-                "fileCount": summary.get("fileCount", 0),
-            },
-            client_id,
-        )
+        downloaded = {
+            "jobId": job_id,
+            "status": "DOWNLOADED",
+            "message": str(summary.get("value")),
+            "fileCount": summary.get("fileCount", 0),
+        }
+        directory = _download_directory(summary.get("files"))
+        if directory:
+            downloaded["directory"] = directory
+        _send(DOWNLOAD_EVENT, downloaded, client_id)
         return
     text = stderr.decode(errors="replace")
     logger.error(

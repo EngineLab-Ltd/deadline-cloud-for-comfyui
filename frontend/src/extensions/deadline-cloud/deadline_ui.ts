@@ -102,6 +102,8 @@ interface Job {
   farmId: string;
   queueId: string;
   submittedAt: string;
+  // Where Download puts the outputs, on the ComfyUI machine. Jobs saved by older panels have none.
+  outputDir?: string;
 }
 
 interface JobStatus {
@@ -127,6 +129,7 @@ interface SubmissionEvent {
   jobId?: string;
   farmId?: string;
   queueId?: string;
+  outputDir?: string;
   error?: string;
 }
 
@@ -136,6 +139,8 @@ interface DownloadEvent {
   progress?: string;
   message?: string;
   fileCount?: number;
+  // The folder the CLI downloaded the files into.
+  directory?: string;
   error?: string;
 }
 
@@ -817,6 +822,7 @@ export function listenForSubmissions() {
           farmId: detail.farmId,
           queueId: detail.queueId,
           submittedAt: new Date().toISOString(),
+          outputDir: detail.outputDir,
         });
         pollJobs();
       }
@@ -2016,7 +2022,11 @@ function listenForDownloads() {
         // The CLI's message says there was nothing to download.
         toast("info", `${name}: ${detail.message}`, 10000);
       } else if (detail.status === "DOWNLOADED") {
-        toast("success", `${detail.message} from ${name} into the output directory it was submitted with.`, 10000);
+        const directory = detail.directory ?? job?.outputDir;
+        const destination = directory
+          ? `to ${directory}`
+          : "into the output directory it was submitted with";
+        toast("success", `${detail.message} from ${name} ${destination}.`, 10000);
       } else {
         toast("error", `Couldn't download the outputs of ${name}. ${detail.error ?? ""}`, 15000);
       }
@@ -2040,6 +2050,13 @@ function renderJobs() {
           "li",
           { title: `${job.jobId}\nSubmitted ${new Date(job.submittedAt).toLocaleString()}` },
           h("div", { className: "dl-path" }, job.name),
+          job.outputDir
+            ? h(
+                "div",
+                { className: "dl-path dl-muted dl-destination", title: job.outputDir },
+                `Downloads to ${job.outputDir}`
+              )
+            : null,
           h(
             "div",
             { className: "dl-row dl-muted" },
@@ -2316,6 +2333,7 @@ textarea.dl-input { resize: vertical; }
 .dl-removed .dl-path { text-decoration: line-through; color: var(--dl-muted); }
 .dl-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
 .dl-jobs li { border-bottom: 1px solid var(--dl-border); padding-bottom: 4px; }
+.dl-destination { font-size: 12px; }
 .dl-jobs .dl-row { justify-content: space-between; font-size: 12px; }
 .dl-progress { display: flex; flex-direction: column; gap: 6px; }
 .dl-progress progress { width: 100%; }

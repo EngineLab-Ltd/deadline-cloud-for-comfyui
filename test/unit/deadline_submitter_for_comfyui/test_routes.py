@@ -2755,3 +2755,45 @@ def test_jobs_refuse_a_lists_field_from_an_older_plan(comfy, monkeypatch):
         "The workflow's lists changed since it was read (OldNameItems)."
     )
     assert not requests.exists()
+
+
+def _studio_step_with_task_parameters(comfy, monkeypatch) -> Path:
+    template = yaml.safe_load(submit.JOB_TEMPLATE.read_text())
+    template["steps"][0]["parameterSpace"] = {
+        "taskParameterDefinitions": [{"name": "Frame", "type": "INT", "range": "1-3"}],
+        "combination": "Frame",
+    }
+    studio = comfy.tmp_path / "studio.yaml"
+    studio.write_text(yaml.safe_dump(template, sort_keys=False))
+    monkeypatch.setenv(submit.TEMPLATE_ENV_VAR, str(studio))
+    return studio
+
+
+@pytest.mark.parametrize("split", [True, False])
+def test_templates_with_their_own_task_parameters_run_lists_whole(comfy, monkeypatch, split):
+    """The submitter doesn't add lists to a step that has task parameters, and says so."""
+    _studio_step_with_task_parameters(comfy, monkeypatch)
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    workflow = {
+        **WORKFLOW,
+        "10": {"class_type": "CreateList", "inputs": {"input0": 1, "input1": 2}},
+    }
+    status, plan = run(call(comfy, "/deadline/plan", {"workflow": workflow, "name": "fox"}))
+    assert status == 200
+    assert plan["sources"] == []
+    warning = "The job template studio.yaml already has task parameters, so the workflow's lists"
+    assert any(item.startswith(warning) for item in plan["warnings"])
+    status, body = run(post(comfy, {"workflow": workflow, "splitTasks": split}))
+    assert status == 202, body
+    template = yaml.safe_load((Path(body["job_bundle"]) / "template.yaml").read_text())
+    space = template["steps"][0]["parameterSpace"]
+    assert [parameter["name"] for parameter in space["taskParameterDefinitions"]] == ["Frame"]
+    assert "List10Items" not in sent_parameters(requests)
+
+
+def test_templates_with_their_own_task_parameters_dont_warn_without_lists(comfy, monkeypatch):
+    _studio_step_with_task_parameters(comfy, monkeypatch)
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    status, plan = run(call(comfy, "/deadline/plan", {"workflow": WORKFLOW, "name": "fox"}))
+    assert status == 200
+    assert not any("task parameters" in warning for warning in plan["warnings"])

@@ -11,7 +11,7 @@ import os
 import re
 import shutil
 import sys
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -551,11 +551,14 @@ def _source_title(source: ItemSource, workflow: dict[str, Any]) -> str:
     return _connection_title(source.node_id, workflow) or source.label
 
 
-def plan_task_lists(api_workflow: dict[str, Any], input_dir: Path | None = None) -> TaskLists:
+def plan_task_lists(
+    api_workflow: dict[str, Any], input_dir: Path | None = None, reserved: Collection[str] = ()
+) -> TaskLists:
     """
     Finds the values in a workflow that the comfy-cli job can run as separate tasks: the items of
     Create List nodes and the images in the folders of folder loaders. Each is its own source of
-    items, and tasks run every combination of them.
+    items, and tasks run every combination of them. reserved lists the job template's parameter
+    names, which the lists' job parameters steer clear of.
     """
     workflow = copy.deepcopy(api_workflow)
     plan = TaskLists(workflow)
@@ -593,11 +596,16 @@ def plan_task_lists(api_workflow: dict[str, Any], input_dir: Path | None = None)
     # Two lists the artist gave the same title keep it, with their node IDs, and a number when that's
     # taken too.
     names: set[str] = set()
+
+    def taken(name: str) -> bool:
+        # reserved holds the job template's own parameter names, which a list's can't repeat.
+        return name in names or f"{name}Items" in reserved
+
     for source in plan.sources:
-        if source.name in names:
+        if taken(source.name):
             name, node = source.name, re.sub(r"[^A-Za-z0-9_]", "_", source.node_id)
             source.name, number = _unique_name(name, f"_{node}"), 2
-            while source.name in names:
+            while taken(source.name):
                 source.name, number = _unique_name(name, f"_{node}_{number}"), number + 1
         names.add(source.name)
     active = plan.active
@@ -645,21 +653,47 @@ def _item_parameters(source: ItemSource) -> dict[str, Any]:
     }
 
 
+def _task_lists_step(job_template: dict[str, Any]) -> dict[str, Any] | None:
+    """The step whose task script has the line that selects each task's items, if any."""
+    for step in job_template.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        files = (step.get("script") or {}).get("embeddedFiles") or []
+        if any(
+            isinstance(file, dict) and _ITEMS_PLACEHOLDER_LINE.search(str(file.get("data", "")))
+            for file in files
+        ):
+            return step
+    return None
+
+
+def _has_task_parameters(step: dict[str, Any]) -> bool:
+    space = step.get("parameterSpace")
+    return isinstance(space, dict) and bool(space.get("taskParameterDefinitions"))
+
+
 def template_supports_task_lists(template: Path) -> bool:
     """
-    Whether a job template's task script has the line that selects each task's items. The template
-    is parsed first, since a JSON template keeps each script on one line, with escaped newlines.
+    Whether the submitter can add the workflow's lists to a job template as task parameters: its
+    task script has the line that selects each task's items, and that step has no task parameters
+    of its own, which the lists' names, number and combination would have to fit around. The
+    template is parsed first, since a JSON template keeps each script on one line, with escaped
+    newlines.
     """
     try:
-        job_template = read_job_template(template)
+        step = _task_lists_step(read_job_template(template))
     except SubmitError:
         return False
-    return any(
-        isinstance(file, dict) and _ITEMS_PLACEHOLDER_LINE.search(str(file.get("data", "")))
-        for step in job_template.get("steps") or []
-        if isinstance(step, dict)
-        for file in (step.get("script") or {}).get("embeddedFiles") or []
-    )
+    return step is not None and not _has_task_parameters(step)
+
+
+def template_has_own_task_parameters(template: Path) -> bool:
+    """Whether the step that selects each task's items already has task parameters."""
+    try:
+        step = _task_lists_step(read_job_template(template))
+    except SubmitError:
+        return False
+    return step is not None and _has_task_parameters(step)
 
 
 def add_task_lists(template: dict[str, Any], sources: list[ItemSource]) -> dict[str, Any]:

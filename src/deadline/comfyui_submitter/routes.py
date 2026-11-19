@@ -41,6 +41,7 @@ from .get_local_assets import (
 )
 from .submit import (
     DEFAULT_WORKFLOW_NAME,
+    FOLDER_LOADERS,
     PICKER_KINDS,
     SubmitError,
     TaskLists,
@@ -62,6 +63,7 @@ from .submit import (
     resolve_deadline_cli,
     resolve_job_template,
     template_defines_parameter,
+    template_has_own_task_parameters,
     template_host_requirements,
     template_supports_task_lists,
     validate_api_workflow,
@@ -430,6 +432,13 @@ def _workflow_name(body: dict[str, Any]) -> str:
     return name[: -len(".json")] if name.lower().endswith(".json") else name
 
 
+def _has_lists(workflow: dict[str, Any]) -> bool:
+    """Whether the workflow has nodes whose items could run as separate tasks."""
+    return any(
+        node.get("class_type") in ("CreateList", *FOLDER_LOADERS) for node in workflow.values()
+    )
+
+
 def _prepare(
     body: dict[str, Any], workflow: dict[str, Any], template: Path, config: dict[str, Any]
 ) -> _Prepared:
@@ -438,13 +447,26 @@ def _prepare(
     Raises SubmitError.
     """
     input_dir = Path(folder_paths.get_input_directory())
-    # A template without the ITEMS line in its task script runs the workflow as one task.
-    items = plan_task_lists(workflow, input_dir) if template_supports_task_lists(template) else None
+    # A template without the ITEMS line in its task script, or whose step has task parameters of
+    # its own, runs the workflow as one task.
+    items = None
+    if template_supports_task_lists(template):
+        reserved = {
+            str(parameter.get("name"))
+            for parameter in read_job_template(template).get("parameterDefinitions") or []
+            if isinstance(parameter, dict)
+        }
+        items = plan_task_lists(workflow, input_dir, reserved)
     prepared = _Prepared(
         workflow=items.workflow if items else workflow,
         items=items,
         conda_channels=resolve_conda_channels(config),
     )
+    if items is None and template_has_own_task_parameters(template) and _has_lists(workflow):
+        prepared.warnings.append(
+            f"The job template {template.name} already has task parameters, so the workflow's "
+            "lists run whole in one task."
+        )
     prepared.values["OutputDir"] = folder_paths.get_output_directory()
     prepared.values["InputDir"] = str(input_dir)
     # A template without Model Directory can't map attached models on the worker.

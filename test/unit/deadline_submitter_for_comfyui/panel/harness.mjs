@@ -324,6 +324,76 @@ if (scenario === "edited-before-replanning") {
   ui.workflowLoaded();
   await ui.loadPlan(true);
   result.splitOtherWorkflow = ui.splitsTasks();
+} else if (scenario.startsWith("value-pairs")) {
+  // Width and Height are paired, so they run together, and Seed runs with each pair.
+  const source = (name, pairWith, count, kind = "integer") => ({
+    name,
+    parameter: `${name}Items`,
+    label: name,
+    title: name,
+    kind,
+    values: [],
+    count,
+    range: `1-${count}`,
+    pairWith,
+  });
+  const sources = [source("Width", "frame", 3), source("Height", "frame", 3), source("Seed", "", 4)];
+  result.counts = ["1-4", "1-20:2", "7, 42, 99", "4-1", "x", "0", ""].map(ui.countRange);
+  result.tasks = ui.taskCount(sources, (item) => item.range);
+  result.pairErrors = ui
+    .taskGroups(sources, (item) => (item.name === "Height" ? "1-2" : item.range))
+    .map(({ error }) => error);
+  // An Integer Values field holds the numbers themselves, which can be any numbers.
+  result.integerCounts = ["-3--1", "0", "7, 42", "4-1", "1," + "9".repeat(21)].map((value) =>
+    ui.taskCount([sources[2]], () => value)
+  );
+  const words = { ...source("Words", "", 5, "string"), values: ["a", "b", "c", "d", "e"] };
+  result.previews = ["2-5", "0", "x"].map((value) => ui.itemsPreview(words, value));
+  // The panel sends each field's range as its job parameter, and won't submit a bad one.
+  state.plan.sources = sources;
+  state.plan.parameters = sources.map(({ parameter, range }) => ({
+    name: parameter,
+    type: "STRING",
+    default: range,
+    userInterface: { groupLabel: "Tasks" },
+  }));
+  state.edits.SeedItems = "x";
+  result.canSubmitBadRange = Boolean(ui.canSubmit());
+  state.edits.SeedItems = "1-2";
+  result.canSubmit = Boolean(ui.canSubmit());
+  await ui.submit();
+  await settle();
+  result.parameters = api.calls.filter(({ path }) => path === "/deadline/jobs").at(-1).body.parameters;
+}
+if (scenario === "value-node-one-task") {
+  // In One task, a value node still runs its items as tasks, and a Create List runs whole.
+  const source = (name, kind, count) => ({
+    name,
+    parameter: `${name}Items`,
+    label: name,
+    title: name,
+    kind,
+    values: [],
+    count,
+    range: `1-${count}`,
+    pairWith: "",
+  });
+  const sources = [source("String10", "string", 3), source("List11", "list", 2)];
+  state.plan.sources = sources;
+  state.plan.parameters = sources.map(({ parameter, range }) => ({
+    name: parameter,
+    type: "STRING",
+    default: range,
+    userInterface: { groupLabel: "Tasks" },
+  }));
+  result.split = ui.splitsTasks();
+  result.splitsSource = sources.map(ui.splitsSource);
+  result.tasks = ui.taskCount(sources, (item) => item.range);
+  await ui.submit();
+  await settle();
+  const body = api.calls.filter(({ path }) => path === "/deadline/jobs").at(-1).body;
+  result.parameters = body.parameters;
+  result.splitTasks = body.splitTasks;
 }
 if (scenario === "parse-bool") {
   // The panel reads a BOOL parameter as OpenJD and the submitter do.

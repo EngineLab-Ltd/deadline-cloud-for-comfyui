@@ -71,7 +71,8 @@ interface HostRequirements {
   amounts?: AmountRequirement[];
 }
 
-// A list in the workflow that runs as tasks, such as a Create List node, as the plan gives it.
+// A list in the workflow that runs as tasks, such as a Create List or a Deadline value node, as
+// the plan gives it.
 interface TaskList {
   name: string;
   // The job parameter that holds the range of items to run.
@@ -82,6 +83,17 @@ interface TaskList {
   values: string[];
   count: number;
   range: string;
+  pairWith: string;
+}
+
+// Lists that run together: a pair, or one list on its own. count is its number of tasks, or null
+// with an error.
+interface TaskGroup {
+  key: string;
+  pairWith: string | null;
+  sources: TaskList[];
+  count: number | null;
+  error: string | null;
 }
 
 // What /deadline/plan returns for the workflow.
@@ -693,12 +705,39 @@ function plural(count: number, noun: string) {
   return `${count} ${noun}${count === 1 ? "" : "s"}`;
 }
 
-// A field's number of tasks, or null with an error. A field holds item numbers from 1 to the list's
-// count, so the farm never gets an item that doesn't exist. Unsplit, every list counts as one.
+// Whether a field is a Deadline value node's. In ComfyUI a value node outputs only its preview item,
+// so its items run as tasks even when the workflow runs as one task.
+function isValueNode(source: TaskList): boolean {
+  return source.kind !== "list" && source.kind !== "folder";
+}
+
+// Whether a field runs its items as separate tasks: a value node's always does, and a Create List's
+// or folder's when the artist chooses Multiple tasks.
+export function splitsSource(source: TaskList): boolean {
+  return isValueNode(source) || splitsTasks();
+}
+
+// The fields that run their items as separate tasks.
+function splitSources(): TaskList[] {
+  return (state.plan?.sources ?? []).filter(splitsSource);
+}
+
+// A field's number of tasks, or null with an error. Other than an Integer Values field, a field
+// holds item numbers from 1 to the list's count, so the farm never gets an item that doesn't exist.
+// A list or folder that runs whole counts as one.
 function fieldCount(source: TaskList, value: string): { count: number | null; error: string | null } {
-  // "0" keeps the list whole in each task, as the submitter's check_item_range takes it.
-  if (!splitsTasks() || String(value).trim() === "0") {
+  // "0" runs a Create List or folder whole in each task, as the submitter's check_item_range takes
+  // it. A value node has no whole list to run, and an Integer Values field's 0 is a number.
+  if (!splitsSource(source) || (!isValueNode(source) && String(value).trim() === "0")) {
     return { count: 1, error: null };
+  }
+  // An Integer Values field holds the numbers themselves, such as seeds, which can be anything.
+  if (source.kind === "integer") {
+    // Up to 20 digits, as a 64-bit seed has and the submitter reads.
+    const count = /\d{21,}/.test(String(value)) ? null : countRange(value);
+    return count === null
+      ? { count, error: `${source.title}: use numbers and ranges, such as 1-4 or 7,42.` }
+      : { count, error: null };
   }
   const parts = parseRange(value);
   // Item numbers have at most 9 digits, as the submitter reads them.
@@ -711,39 +750,74 @@ function fieldCount(source: TaskList, value: string): { count: number | null; er
     ? { count: countRange(value), error: null }
     : {
         count: null,
-        error: `${source.title}: use item numbers from 1 to ${source.count}, such as 1-${source.count} or 2,3, or 0 for all of them in each task.`,
+        error:
+          `${source.title}: use item numbers from 1 to ${source.count}, such as 1-${source.count} or 2,3` +
+          (isValueNode(source) ? "." : ", or 0 for all of them in each task."),
       };
 }
 
-// The number of tasks, from every combination of the sources, or null when a field has an error.
+// Groups the lists that run together, in workflow order: a pair, or one list on its own.
+export function taskGroups(
+  sources: TaskList[],
+  valueOf: (source: TaskList) => string
+): TaskGroup[] {
+  const groups = new Map<string, TaskGroup>();
+  for (const source of sources) {
+    const key = source.pairWith ? `pair:${source.pairWith}` : `source:${source.name}`;
+    let group = groups.get(key);
+    if (!group) {
+      group = { key, pairWith: source.pairWith || null, sources: [], count: null, error: null };
+      groups.set(key, group);
+    }
+    group.sources.push(source);
+  }
+  for (const group of groups.values()) {
+    const fields = group.sources.map((source) => fieldCount(source, valueOf(source)));
+    const invalid = fields.find(({ error }) => error);
+    if (invalid) {
+      group.error = invalid.error;
+    } else if (new Set(fields.map(({ count }) => count)).size > 1) {
+      const items = group.sources.map((source, index) => `${source.title} has ${fields[index].count}`);
+      group.error = `Paired fields need the same number of items: ${items.join(", ")}.`;
+    } else {
+      group.count = fields[0].count;
+    }
+  }
+  return [...groups.values()];
+}
+
+// The number of tasks, from every combination of the groups, or null when a group has an error.
 export function taskCount(
   sources: TaskList[],
   valueOf: (source: TaskList) => string
 ): number | null {
   let total = 1;
-  for (const source of sources) {
-    const { count } = fieldCount(source, valueOf(source));
-    if (count === null) {
+  for (const group of taskGroups(sources, valueOf)) {
+    if (group.count === null) {
       return null;
     }
-    total *= count;
+    total *= group.count;
   }
   return total;
 }
 
+function currentGroups() {
+  return taskGroups(splitSources(), itemsValue);
+}
+
 function currentTaskCount() {
-  const sources = state.plan?.sources ?? [];
+  const sources = splitSources();
   return sources.length ? taskCount(sources, itemsValue) : 1;
 }
 
-// How the fields multiply into tasks, such as "3 × 2 = 6 tasks", leaving out fields of one item.
+// How the groups multiply into tasks, such as "3 × 2 = 6 tasks", leaving out groups of one task.
 function taskMath() {
   const total = currentTaskCount();
   if (total === null) {
     return "";
   }
-  const factors = (state.plan?.sources ?? [])
-    .map((source) => fieldCount(source, itemsValue(source)).count ?? 1)
+  const factors = currentGroups()
+    .map((group) => group.count ?? 1)
     .filter((count) => count > 1);
   return factors.length > 1 ? `${factors.join(" × ")} = ${plural(total, "task")}` : plural(total, "task");
 }
@@ -761,7 +835,8 @@ function selectedItems(expression: string) {
 
 // What a field's items are, such as the first prompts of a Create List or images of a folder.
 export function itemsPreview(source: TaskList, value: string): string {
-  if (!source.values?.length || fieldCount(source, value).error) {
+  // Integer fields show their values already.
+  if (source.kind === "integer" || !source.values?.length || fieldCount(source, value).error) {
     return "";
   }
   if (String(value).trim() === "0") {
@@ -883,10 +958,10 @@ function bundleRequest() {
       parameters[parameter.name] = queueParameterValue(parameter);
     }
   }
-  // The lists' ranges, when the artist splits them into tasks. Otherwise the job has no task
-  // parameters to send them to.
+  // The ranges of the fields that run as tasks. A list that runs whole has no task parameter to
+  // send its range to.
   for (const source of plan?.sources ?? []) {
-    if (splitsTasks()) {
+    if (splitsSource(source)) {
       parameters[source.parameter] = itemsValue(source);
     } else {
       delete parameters[source.parameter];
@@ -1396,7 +1471,7 @@ function renderStatus() {
     // A workflow split into tasks says how many it runs.
     const count = currentTaskCount();
     const tasks =
-      plan.sources?.length && splitsTasks()
+      splitSources().length
         ? ` · ${count === null ? "check the tasks below" : plural(count, "task")}`
         : "";
     children.push(
@@ -1409,7 +1484,7 @@ function renderStatus() {
     );
     // With Attach Custom Nodes off, the workers provide the custom nodes.
     const ignored = attachesNodes() ? [] : plan.nodeWarnings ?? [];
-    const warnings = [...(plan.warnings ?? []), ...(splitsTasks() ? plan.taskWarnings ?? [] : [])];
+    const warnings = [...(plan.warnings ?? []), ...(splitSources().length ? plan.taskWarnings ?? [] : [])];
     for (const warning of warnings) {
       if (!ignored.includes(warning)) {
         children.push(h("div", { className: "dl-notice dl-warn-box" }, warning));
@@ -1436,13 +1511,27 @@ function renderStatus() {
   return h("div", { className: "dl-status" }, children);
 }
 
+function groupCountText(group: { count: number | null }) {
+  return group.count === null ? "" : plural(group.count, "task");
+}
+
 // Updates what depends on the list fields without re-rendering them, so they keep focus.
 function updateCounts() {
   for (const view of views) {
     view.render(["status", "submit"]);
   }
+  const groups = new Map(currentGroups().map((group) => [group.key, group]));
   for (const element of document.querySelectorAll<HTMLElement>("[data-role='task-math']")) {
     element.textContent = taskMath();
+  }
+  for (const element of document.querySelectorAll<HTMLElement>("[data-group-count]")) {
+    const group = groups.get(element.dataset.groupCount ?? "");
+    element.textContent = groupCountText(group ?? { count: null });
+  }
+  for (const element of document.querySelectorAll<HTMLElement>("[data-group-error]")) {
+    const error = groups.get(element.dataset.groupError ?? "")?.error ?? "";
+    element.textContent = error;
+    element.hidden = !error;
   }
   for (const source of state.plan?.sources ?? []) {
     const value = itemsValue(source);
@@ -1453,19 +1542,12 @@ function updateCounts() {
       }
     }
     for (const element of document.querySelectorAll<HTMLElement>(`[data-preview="${source.parameter}"]`)) {
-      element.textContent = itemsPreview(source, value);
-    }
-    for (const element of document.querySelectorAll<HTMLElement>(`[data-item-error="${source.parameter}"]`)) {
-      const { error } = fieldCount(source, value);
-      element.textContent = error ?? "";
-      element.hidden = !error;
+      element.textContent = itemsPreview(source, itemsValue(source));
     }
   }
 }
 
 function taskListField(source: TaskList) {
-  const value = itemsValue(source);
-  const { error } = fieldCount(source, value);
   return h(
     "div",
     { className: "dl-field" },
@@ -1485,11 +1567,10 @@ function taskListField(source: TaskList) {
         updateCounts();
       },
     }),
-    h("span", { className: "dl-preview dl-path", "data-preview": source.parameter }, itemsPreview(source, value)),
     h(
-      "div",
-      { className: "dl-notice dl-error", "data-item-error": source.parameter, hidden: !error },
-      error ?? ""
+      "span",
+      { className: "dl-preview dl-path", "data-preview": source.parameter },
+      itemsPreview(source, itemsValue(source))
     )
   );
 }
@@ -1499,16 +1580,21 @@ function renderTasks() {
   if (!sources.length) {
     return null;
   }
-  const mode = select(
-    [
-      ["one", "One task"],
-      ["split", "Multiple tasks"],
-    ],
-    splitsTasks() ? "split" : "one",
-    (value: string) => setSplit(value === "split")
-  );
+  // The choice is for Create Lists and folders. Value nodes run their items as tasks either way.
+  const hasLists = sources.some((source) => !isValueNode(source));
+  const mode = hasLists
+    ? select(
+        [
+          ["one", "One task"],
+          ["split", "Multiple tasks"],
+        ],
+        splitsTasks() ? "split" : "one",
+        (value: string) => setSplit(value === "split")
+      )
+    : null;
   const title = ["Tasks", h("span", { className: "dl-task-math", "data-role": "task-math" }, taskMath())];
-  if (!splitsTasks()) {
+  const groups = currentGroups();
+  if (!groups.length) {
     return section(
       title,
       true,
@@ -1520,16 +1606,35 @@ function renderTasks() {
       )
     );
   }
+  const help = [
+    hasLists && !splitsTasks()
+      ? "Create Lists and folders run whole, as in ComfyUI. Choose Multiple tasks to run each of their items as its own task."
+      : "",
+    "Each group below runs its items as separate tasks, and groups multiply. Number fields hold the values to run, such as 1-4 or 7,42. Other fields pick items by number, such as 1-2 or 2,3. Set a Create List's or folder's field to 0 to run it whole in each task.",
+  ];
   return section(
     title,
     true,
     mode,
-    h(
-      "p",
-      { className: "dl-help" },
-      "Each field below runs its items as separate tasks, and fields multiply. Narrow a field to the items to run by number, such as 1-2 or 2,3, or set it to 0 to run that list whole in each task."
-    ),
-    sources.map(taskListField)
+    h("p", { className: "dl-help" }, help.filter(Boolean).join(" ")),
+    groups.map((group) =>
+      h(
+        "div",
+        { className: `dl-item-group${group.pairWith ? " dl-item-pair" : ""}` },
+        h(
+          "div",
+          { className: "dl-group-header" },
+          h("span", { className: "dl-group-name" }, group.pairWith ?? ""),
+          h("span", { className: "dl-muted", "data-group-count": group.key }, groupCountText(group))
+        ),
+        group.sources.map(taskListField),
+        h(
+          "div",
+          { className: "dl-notice dl-error", "data-group-error": group.key, hidden: !group.error },
+          group.error ?? ""
+        )
+      )
+    )
   );
 }
 
@@ -2322,7 +2427,7 @@ function renderSubmit() {
   return h(
     "button",
     { className: "dl-button dl-primary dl-wide", disabled: !canSubmit(), onClick: submit },
-    state.plan?.sources?.length && splitsTasks() && count ? `Submit ${plural(count, "task")}` : "Submit"
+    splitSources().length && count ? `Submit ${plural(count, "task")}` : "Submit"
   );
 }
 
@@ -2680,6 +2785,10 @@ textarea.dl-input { resize: vertical; }
 .dl-section-body { padding-bottom: 8px; }
 .dl-help { color: var(--dl-muted); font-size: 12px; margin: 0 0 8px; }
 .dl-task-math { float: right; font-weight: 400; color: var(--dl-muted); }
+.dl-item-group { margin-bottom: 10px; }
+.dl-item-pair { border-left: 2px solid var(--dl-border); padding-left: 8px; }
+.dl-group-header { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; margin-bottom: 4px; }
+.dl-group-name { font-weight: 600; }
 .dl-preview { color: var(--dl-muted); font-size: 11px; }
 .dl-preview:empty { display: none; }
 .dl-muted { color: var(--dl-muted); }

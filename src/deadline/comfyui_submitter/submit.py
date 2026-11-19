@@ -306,19 +306,31 @@ def _quoted(value: Any) -> str:
 
 
 # Task lists: the values that the comfy-cli job runs as separate tasks. Each source of them in the
-# workflow becomes its own task parameter, so tasks run every combination of their items. The job
-# template's task script selects each task's item, using these names, which
-# test_template_script.py keeps in step.
+# workflow becomes its own task parameter, so tasks run every combination of their items, unless
+# value nodes are paired. The job template's task script selects each task's item, using these
+# names, which test_template_script.py keeps in step.
+STRING_NODE = "DeadlineStringValues"
+INTEGER_NODE = "DeadlineIntegerValues"
+IMAGE_NODE = "DeadlineImageValues"
+VALUE_NODES = (STRING_NODE, INTEGER_NODE, IMAGE_NODE)
 # Core nodes that load every image in a folder of the input directory as a list.
 FOLDER_LOADERS = ("LoadImageDataSetFromFolder",)
 # Nodes whose folder input names a folder of the input directory, which is sent with the job.
-FOLDER_INPUT_NODES = (*FOLDER_LOADERS, "LoadImageTextDataSetFromFolder")
+FOLDER_INPUT_NODES = (*FOLDER_LOADERS, "LoadImageTextDataSetFromFolder", IMAGE_NODE)
 # The images that LoadImageDataSetFromFolder loads.
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 # The _meta key that marks the nodes the task script splits, with the task parameter of each.
 ITEM_META = "deadline_item"
+# What a value node outputs in tasks that don't split it: its preview item.
+PREVIEW_META = "deadline_preview"
 # The images of a folder, as paths in the input directory, in the order its items are numbered.
 FILES_META = "deadline_files"
+# A paired Deadline Integer Values node's numbers, in the order its items are numbered.
+VALUES_META = "deadline_values"
+# The most numbers a Deadline Integer Values node can list.
+MAX_INTEGER_VALUES = 10000
+# The most digits a number in Deadline Integer Values can have, as many as a 64-bit seed.
+MAX_INTEGER_DIGITS = 20
 # OpenJD allows 16 task parameters in a step.
 MAX_ITEM_SOURCES = 16
 # The line of the task script that create_job_bundle fills in with each task's items. A job
@@ -336,8 +348,108 @@ _ANY_LIST_ITEM_INPUT = re.compile(r"(inputs\.)?input\d+", re.ASCII)
 _DEFAULT_TITLES = {
     "CreateList": "Create List",
     "LoadImageDataSetFromFolder": "Load Image (from Folder)",
+    STRING_NODE: "Deadline String Values",
+    INTEGER_NODE: "Deadline Integer Values",
+    IMAGE_NODE: "Deadline Image Values",
 }
 _ITEMS_PLACEHOLDER_LINE = re.compile(rf"^[ \t]*{re.escape(ITEMS_PLACEHOLDER)}[ \t]*$", re.MULTILINE)
+_INTEGER_RANGE = re.compile(r"(-?\d+)(?:-(-?\d+)(?::(\d+))?)?")
+
+
+# How a Deadline String Values node splits its text into values: one per line, or at lines of
+# "---", so that a value can span several lines, such as a prompt with paragraphs.
+SPLIT_BY_LINES = "lines"
+SPLIT_BY_SEPARATOR = "--- lines"
+SPLIT_BY_CHOICES = (SPLIT_BY_LINES, SPLIT_BY_SEPARATOR)
+
+
+def string_values(text: Any, split_by: Any = SPLIT_BY_LINES) -> list[str]:
+    """
+    The values of a Deadline String Values node: one per non-empty line, or the text between lines
+    of "---", without the blank lines and spaces around it. Lines end at newlines only:
+    splitlines() would also split a value at characters such as U+2028. Raises ValueError for an
+    unknown split_by.
+    """
+    lines = [line.rstrip("\r") for line in str(text).split("\n")]
+    if split_by == SPLIT_BY_LINES:
+        return [line.strip() for line in lines if line.strip()]
+    if split_by != SPLIT_BY_SEPARATOR:
+        raise ValueError(f"split_by is {split_by!r}, not one of {', '.join(SPLIT_BY_CHOICES)}.")
+    values: list[str] = []
+    block: list[str] = []
+    for line in [*lines, "---"]:
+        if line.strip() == "---":
+            value = "\n".join(block).strip()
+            if value:
+                values.append(value)
+            block = []
+        else:
+            block.append(line)
+    return values
+
+
+def first_line(value: str) -> str:
+    """A value as the panel previews it: its first line, with an ellipsis if there's more."""
+    line, _, rest = value.partition("\n")
+    return f"{line} …" if rest.strip() else line
+
+
+def _integer_ranges(text: Any) -> list[range]:
+    ranges = []
+    for part in re.sub(r"\s+", "", str(text)).split(","):
+        if not part:
+            continue
+        match = _INTEGER_RANGE.fullmatch(part)
+        if not match:
+            raise ValueError(f"{part!r} isn't a number or a range such as 1-10 or 1-10:2.")
+        # A 64-bit seed has 20 digits. Python can't read numbers past 4300 digits at all.
+        if any(len(number.lstrip("-")) > MAX_INTEGER_DIGITS for number in match.groups() if number):
+            raise ValueError(f"A number has more than {MAX_INTEGER_DIGITS} digits.")
+        start = int(match[1])
+        end = int(match[2]) if match[2] is not None else start
+        step = int(match[3] or 1)
+        if end < start or step < 1:
+            raise ValueError(f"The range {part!r} has to count up.")
+        # Counted before building the range, since len() can't count a range this long.
+        if (end - start) // step + 1 > MAX_INTEGER_VALUES:
+            raise ValueError(f"There are more than {MAX_INTEGER_VALUES} numbers.")
+        ranges.append(range(start, end + 1, step))
+    return ranges
+
+
+def integer_values(text: Any, *, allow_repeats: bool = False) -> list[int]:
+    """
+    The values of a Deadline Integer Values node: numbers and OpenJD ranges, such as "1-4",
+    "1-20:2" or "7, 42, 99". Only a paired node can repeat a number, such as a width that two
+    frame sizes share.
+    """
+    values: list[int] = []
+    ranges = _integer_ranges(text)
+    for numbers in ranges:
+        if len(values) + len(numbers) > MAX_INTEGER_VALUES:
+            raise ValueError(f"There are more than {MAX_INTEGER_VALUES} numbers.")
+        values.extend(numbers)
+    if not allow_repeats and len(set(values)) < len(values):
+        raise ValueError("A number is listed more than once.")
+    # OpenJD also refuses parts that overlap without sharing a number, such as "1-9:2,4".
+    spans = sorted((numbers[0], numbers[-1]) for numbers in ranges if numbers)
+    if not allow_repeats and any(spans[i][1] >= spans[i + 1][0] for i in range(len(spans) - 1)):
+        raise ValueError("Two parts overlap. Write each part's numbers apart, such as 1-3,5-9.")
+    return values
+
+
+def _integer_range_expression(text: Any) -> str:
+    """The OpenJD range expression for a Deadline Integer Values node's values."""
+    parts = []
+    for numbers in _integer_ranges(text):
+        if len(numbers) == 1:
+            parts.append(str(numbers.start))
+        else:
+            last = numbers[-1]
+            parts.append(
+                f"{numbers.start}-{last}" + (f":{numbers.step}" if numbers.step > 1 else "")
+            )
+    return ",".join(parts)
 
 
 def input_path(input_dir: Path | str, name: Any) -> Path | None:
@@ -371,7 +483,8 @@ def image_files(directory: Path) -> list[str]:
 
 def input_folders(workflow: dict[str, Any], input_dir: Path) -> list[Path]:
     """
-    Returns the folders in ComfyUI's input directory that the workflow's folder loaders read.
+    Returns the folders in ComfyUI's input directory that the workflow's folder loaders and Deadline
+    Image Values nodes read.
     """
     folders = set()
     for node in workflow.values():
@@ -392,13 +505,15 @@ class ItemSource:
     name: str
     label: str
     count: int
-    # "list" or "folder".
+    # "list", "folder", "string", "integer", "paired-integer" or "image".
     kind: str = "list"
     # The items, as far as the submitter knows them, for the job parameter's description.
     values: list[str] = field(default_factory=list)
     # Whether it gets a task parameter. A step can have only MAX_ITEM_SOURCES of them.
     enabled: bool = True
-    # The job parameter's default range of item numbers.
+    # Value nodes with the same pair_with run their items together rather than in combination.
+    pair_with: str = ""
+    # The job parameter's default range: item numbers, or an Integer Values node's values.
     range: str = ""
     node_id: str = ""
     # What the panel calls it. The label names the node.
@@ -407,6 +522,14 @@ class ItemSource:
     def __post_init__(self) -> None:
         self.range = self.range or f"1-{self.count}"
         self.title = self.title or self.label
+
+    @property
+    def value_node(self) -> bool:
+        """
+        Whether it's a Deadline value node. They run their items as tasks even when the workflow
+        runs as one task: in ComfyUI they output only their preview item.
+        """
+        return self.kind not in ("list", "folder")
 
     @property
     def parameter(self) -> str:
@@ -423,16 +546,42 @@ MAX_SOURCE_NAME = 64 - len("Items")
 _ITEM_RANGE_PART = re.compile(r"(\d{1,9})(?:\s*-\s*(\d{1,9})(?:\s*:\s*(\d{1,9}))?)?", re.ASCII)
 
 
-def check_item_range(source: ItemSource, value: Any) -> None:
+# The longest range expression OpenJD takes for a task parameter.
+MAX_RANGE_LENGTH = 1024
+
+
+def check_item_range(source: ItemSource, value: Any) -> int:
     """
     Checks the range of a list's items to run, as OpenJD and the task script take it: "0" on its
-    own, or item numbers from 1 to the list's count, in parts that don't overlap. The panel checks
-    it against the plan it made, so this catches a list that changed since. Raises SubmitError.
+    own for a list or folder, or item numbers from 1 to the list's count, in parts that don't
+    overlap. An Integer Values field holds its numbers instead. The panel checks it against the
+    plan it made, so this catches a list that changed since. Returns the number of tasks it runs.
+    Raises SubmitError.
     """
     text = str(value).strip()
+    if len(text) > MAX_RANGE_LENGTH:
+        raise SubmitError(
+            f"{source.title}: the field is longer than {MAX_RANGE_LENGTH} characters. Use fewer, "
+            "longer ranges."
+        )
+    # An Integer Values field holds the numbers themselves, such as seeds.
+    if source.kind == "integer":
+        try:
+            numbers = integer_values(text)
+        except ValueError as e:
+            raise SubmitError(f"{source.title}: {e}") from None
+        if not numbers:
+            raise SubmitError(f"{source.title}: add the numbers to run, such as 1-4 or 7,42.")
+        return len(numbers)
     if text == "0":
-        return
+        if not source.value_node:
+            return 1
+        raise SubmitError(
+            f"{source.title}: use item numbers such as 1-{source.count} or 2,3. A value node's "
+            "items always run as separate tasks, so it has no 0."
+        )
     spans: list[tuple[int, int]] = []
+    total = 0
     for part in text.split(","):
         match = _ITEM_RANGE_PART.fullmatch(part.strip())
         if match:
@@ -442,6 +591,7 @@ def check_item_range(source: ItemSource, value: Any) -> None:
                 f"{source.title}: use item numbers such as 1-{source.count} or 2,3, not {text!r}."
             )
         spans.append((start, start + (end - start) // step * step))
+        total += (end - start) // step + 1
     spans.sort()
     if any(spans[i][1] >= spans[i + 1][0] for i in range(len(spans) - 1)):
         raise SubmitError(f"{source.title}: {text!r} lists an item more than once.")
@@ -450,6 +600,7 @@ def check_item_range(source: ItemSource, value: Any) -> None:
             f"{source.title} has {source.count} items, so it can't run {text!r}. Read the "
             "workflow again, then choose its items."
         )
+    return total
 
 
 @dataclass
@@ -556,17 +707,78 @@ def _source_title(source: ItemSource, workflow: dict[str, Any]) -> str:
     return _connection_title(source.node_id, workflow) or source.label
 
 
+def _value_source(
+    node_id: str, node: dict[str, Any], input_dir: Path | None
+) -> tuple[ItemSource | None, str | None]:
+    """
+    Marks a value node with its preview item, which the task script outputs when the node isn't
+    split, and returns its source when it has more than one item, or an error.
+    """
+    class_type = node["class_type"]
+    inputs = node.get("inputs", {})
+    meta = node["_meta"]
+    label = f"{_DEFAULT_TITLES[class_type]} #{node_id}"
+    preview = inputs.get("preview_item", 1)
+    preview = preview if isinstance(preview, int) and preview >= 1 else 1
+    pair_with = inputs.get("pair_with")
+    pair_with = pair_with.strip() if isinstance(pair_with, str) else ""
+    if class_type == IMAGE_NODE:
+        folder = inputs.get("folder")
+        directory = input_path(input_dir, folder) if input_dir else None
+        files = image_files(directory) if directory else []
+        if not files:
+            return None, f"{label} has no images in the folder {folder!r} of the input directory."
+        meta[FILES_META] = [f"{folder}/{name}" for name in files]
+        values = files
+        kind = "image"
+    elif not isinstance(inputs.get("values"), str):
+        return None, f"{label} needs its values typed in, not connected."
+    elif class_type == INTEGER_NODE:
+        try:
+            numbers = integer_values(inputs["values"], allow_repeats=bool(pair_with))
+        except ValueError as e:
+            return None, f"{label}: {e}"
+        values = [str(number) for number in numbers]
+        kind = "integer"
+    else:
+        try:
+            values = string_values(inputs["values"], inputs.get("split_by", SPLIT_BY_LINES))
+        except ValueError as e:
+            return None, f"{label}: {e}"
+        kind = "string"
+        # The task script selects the task's line from these, so it splits them as the panel does.
+        meta[VALUES_META] = values
+    if not values:
+        return None, f"{label} has no values."
+    if preview > len(values):
+        return None, f"{label} has {len(values)} items, so it can't preview item {preview}."
+    if kind == "image":
+        meta[PREVIEW_META] = meta[FILES_META][preview - 1]
+    else:
+        meta[PREVIEW_META] = int(values[preview - 1]) if kind == "integer" else values[preview - 1]
+    if len(values) < 2:
+        return None, None
+    source = ItemSource("", label, len(values), kind, values, pair_with=pair_with, node_id=node_id)
+    if kind == "integer":
+        source.range = _integer_range_expression(inputs["values"])
+        if len(source.range) > 1024:
+            return None, f"{label} has too many numbers and ranges. Use fewer, longer ranges."
+    return source, None
+
+
 def plan_task_lists(
     api_workflow: dict[str, Any], input_dir: Path | None = None, reserved: Collection[str] = ()
 ) -> TaskLists:
     """
     Finds the values in a workflow that the comfy-cli job can run as separate tasks: the items of
-    Create List nodes and the images in the folders of folder loaders. Each is its own source of
-    items, and tasks run every combination of them. reserved lists the job template's parameter
-    names, which the lists' job parameters steer clear of.
+    Create List nodes, the images in the folders of folder loaders and the values of the Deadline
+    value nodes. Each is its own source of items, and tasks run every combination of them, except
+    value nodes that are paired. reserved lists the job template's parameter names, which the
+    lists' job parameters steer clear of. Raises SubmitError for a value node the job can't run.
     """
     workflow = copy.deepcopy(api_workflow)
     plan = TaskLists(workflow)
+    errors = []
     for node_id, node in workflow.items():
         class_type = node.get("class_type")
         inputs = node.get("inputs", {})
@@ -594,10 +806,16 @@ def plan_task_lists(
                     files,
                     node_id=node_id,
                 )
+        elif class_type in VALUE_NODES:
+            source, error = _value_source(node_id, node, input_dir)
+            if error:
+                errors.append(error)
         if source:
             source.name = _source_name(source.kind, node_id, node)
             source.title = _source_title(source, workflow)
             plan.sources.append(source)
+    if errors:
+        raise SubmitError(" ".join(errors))
     # Two lists the artist gave the same title keep it, with their node IDs, and a number when that's
     # taken too.
     names: set[str] = set()
@@ -613,14 +831,36 @@ def plan_task_lists(
             while taken(source.name):
                 source.name, number = _unique_name(name, f"_{node}_{number}"), number + 1
         names.add(source.name)
-    active = plan.active
-    for source in active[MAX_ITEM_SOURCES:]:
+    # Value nodes take the first places. In ComfyUI they output only their preview item, so one
+    # without a task parameter wouldn't run its items. Lists and folders past the limit run whole.
+    value_nodes = [source for source in plan.sources if source.value_node]
+    if len(value_nodes) > MAX_ITEM_SOURCES:
+        raise SubmitError(
+            f"Deadline Cloud splits up to {MAX_ITEM_SOURCES} fields into tasks, and the workflow "
+            f"has {len(value_nodes)} Deadline value nodes with more than one item. Use at most "
+            f"{MAX_ITEM_SOURCES}."
+        )
+    lists = [source for source in plan.sources if not source.value_node]
+    whole = lists[MAX_ITEM_SOURCES - len(value_nodes) :]
+    for source in whole:
         source.enabled = False
-    if len(active) > MAX_ITEM_SOURCES:
+    if whole:
         plan.warnings.append(
             f"Deadline Cloud splits up to {MAX_ITEM_SOURCES} fields into tasks, so these run "
-            f"whole in each task: {', '.join(s.label for s in active[MAX_ITEM_SOURCES:])}."
+            f"whole in each task: {', '.join(s.label for s in whole)}."
         )
+    _check_pairs(plan)
+    # OpenJD sorts an integer range and can't repeat a number, so a paired Integer Values node's
+    # numbers wouldn't stay in step with its partners' items. A paired one selects its items by
+    # number instead, like the other value nodes, and the task script looks up its value. So does
+    # one with repeated numbers whose pair didn't match.
+    for source in plan.active:
+        if source.kind == "integer" and (
+            source.pair_with or len(set(source.values)) < len(source.values)
+        ):
+            source.kind = "paired-integer"
+            source.range = f"1-{source.count}"
+            workflow[source.node_id]["_meta"][VALUES_META] = [int(value) for value in source.values]
     # Mark the nodes of the sources that run as separate tasks. The task script runs others whole.
     for source in plan.active:
         workflow[source.node_id]["_meta"][ITEM_META] = source.name
@@ -630,20 +870,66 @@ def plan_task_lists(
     return plan
 
 
+def _check_pairs(plan: TaskLists) -> None:
+    """Unpairs value nodes whose pair has different numbers of items, with a warning."""
+    pairs: dict[str, list[ItemSource]] = {}
+    for source in plan.active:
+        if source.pair_with:
+            pairs.setdefault(source.pair_with, []).append(source)
+    for pair_with, sources in pairs.items():
+        if len({source.count for source in sources}) > 1:
+            plan.warnings.append(
+                f"The value nodes paired as {pair_with!r} have different numbers of items ("
+                + ", ".join(f"{source.label}: {source.count}" for source in sources)
+                + "), so every combination of them runs."
+            )
+            for source in sources:
+                source.pair_with = ""
+
+
+def combination(sources: list[ItemSource]) -> str | None:
+    """
+    The OpenJD combination expression that runs paired sources' items together, such as
+    "(Prompt, Lora) * Seed", or None when every combination runs, which is OpenJD's default.
+    """
+    terms: dict[str, list[str]] = {}
+    for source in sources:
+        terms.setdefault(source.pair_with or f"\0{source.name}", []).append(source.name)
+    if all(len(names) == 1 for names in terms.values()):
+        return None
+    return " * ".join(
+        f"({', '.join(names)})" if len(names) > 1 else names[0] for names in terms.values()
+    )
+
+
 def _item_parameters(source: ItemSource) -> dict[str, Any]:
     """The job parameter that holds the range of a source's items to run."""
     shown = []
     for index, value in enumerate(source.values, start=1):
+        value = first_line(value)
         shown.append(f"{index}: {value[:60]}{'...' if len(value) > 60 else ''}")
         if index == 10 and source.count > 10:
             shown.append(f"and {source.count - 10} more")
             break
-    description = (
-        f"The items of {source.label} to run as separate tasks, numbered from 1, for example "
-        f'"1-{source.count}" or "2,3". "0" on its own runs the whole list in each task. Every '
-        "combination of the lists is a task."
-    )
-    if shown:
+    if source.kind == "integer":
+        description = (
+            f"The values of {source.label} to run as separate tasks, as numbers and ranges such "
+            'as "1-100", "1-20:2" or "7,42,99".'
+        )
+    else:
+        description = (
+            f"The items of {source.label} to run as separate tasks, numbered from 1, for example "
+            f'"1-{source.count}" or "2,3".'
+            + (' "0" on its own runs the whole list in each task.' if not source.value_node else "")
+        )
+    description += " Every combination of the lists is a task"
+    if source.pair_with:
+        description += (
+            f", except that the value nodes paired as {source.pair_with!r} run their items "
+            "together, so keep the same number of them"
+        )
+    description += "."
+    if shown and source.kind != "integer":
         description += " Items: " + "; ".join(shown) + "."
     return {
         "name": source.parameter,
@@ -729,6 +1015,9 @@ def add_task_lists(template: dict[str, Any], sources: list[ItemSource]) -> dict[
             {"name": source.name, "type": "INT", "range": f"{{{{Param.{source.parameter}}}}}"}
             for source in sources
         )
+        expression = combination(sources)
+        if expression:
+            space["combination"] = expression
     return template
 
 
@@ -748,17 +1037,37 @@ def _dump_template(job_template: dict[str, Any]) -> str:
     return yaml.dump(job_template, Dumper=TemplateDumper, sort_keys=False, width=100)
 
 
+def _input_strings(api_workflow: dict[str, Any]):
+    """
+    Yields every string input value of the API workflow. A Deadline String Values node yields
+    each of its values, since each task uses one of them, for example one LoRA name per task.
+    """
+    for node in api_workflow.values():
+        string_node = node.get("class_type") == STRING_NODE
+        for key, value in node.get("inputs", {}).items():
+            if not isinstance(value, str):
+                continue
+            if string_node and key == "values":
+                try:
+                    yield from string_values(value, node["inputs"].get("split_by", SPLIT_BY_LINES))
+                except ValueError:
+                    # Planning reports it.
+                    yield from string_values(value)
+            else:
+                yield value
+
+
 def workflow_models(api_workflow: dict[str, Any]) -> list[str]:
     """
-    Lists the model files the workflow loads: every string input that names a model file. The
-    submitter attaches a local copy when this machine has the file. Otherwise the job fails unless
-    the workers already have it, for example through Extra Model Paths Config.
+    Lists the model files the workflow loads: every string input that names a model file, and
+    each value of a Deadline String Values node that does. The submitter attaches a local copy
+    when this machine has the file. Otherwise the job fails unless the workers already have it,
+    for example through Extra Model Paths Config.
     """
     models = {
         value.replace("\\", "/")
-        for node in api_workflow.values()
-        for value in node.get("inputs", {}).values()
-        if isinstance(value, str) and value.lower().endswith(MODEL_EXTENSIONS)
+        for value in _input_strings(api_workflow)
+        if value.lower().endswith(MODEL_EXTENSIONS)
     }
     return sorted(models)
 
@@ -783,11 +1092,14 @@ def local_node_packs(
     The custom node packs to attach, by folder or file name. loaded_dirs maps each node type that
     this ComfyUI loaded from a custom_nodes folder to its pack folder, or single .py file, so
     ComfyUI's own nodes aren't in it. Workers get every pack the workflow uses through job
-    attachments. Each path is listed once, however many of its nodes are used.
+    attachments, except this extension: the job replaces its value nodes. Each path is listed
+    once, however many of its nodes are used.
     """
     packs: dict[str, Path] = {}
     for node in api_workflow.values():
         class_type = node.get("class_type") if isinstance(node, dict) else None
+        if class_type in VALUE_NODES:
+            continue
         path = loaded_dirs.get(class_type) if isinstance(class_type, str) else None
         if path is not None:
             packs.setdefault(path.name, path)

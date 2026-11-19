@@ -338,8 +338,9 @@ steps:
         import urllib.request
 
         PORT = os.environ["COMFYUI_PORT"]
-        # The task's item of each list it runs as tasks, by task parameter. The ComfyUI Submitter
-        # fills this in. A source without one runs whole.
+        # The task's item of each list it runs as tasks, or value for a Deadline Integer Values
+        # node, by task parameter. The ComfyUI Submitter fills this in. A source without one runs
+        # whole, or outputs its preview item.
         ITEMS = {}
         OUTPUT_DIR = r"{{Param.OutputDir}}"
         WORKFLOW_TIMEOUT = int("{{Param.WorkflowTimeout}}")
@@ -411,6 +412,7 @@ steps:
 
         # Select this task's item of each source, which the ComfyUI Submitter marks with _meta keys.
         # Item 0 runs the source whole.
+        VALUE_NODES = ("DeadlineStringValues", "DeadlineIntegerValues", "DeadlineImageValues")
         found = set()
 
 
@@ -422,17 +424,50 @@ steps:
             return index
 
 
-        for node_id, node in workflow.items():
+        def replace_node(node_id, value):
+            """Replaces a node with the value of its first output."""
+            del workflow[node_id]
+            for other in workflow.values():
+                for key, link in other.get("inputs", {}).items():
+                    if link == [node_id, 0]:
+                        other["inputs"][key] = value
+
+
+        # The value nodes' values, which go in output file names, even when they're 0.
+        values = set()
+        for node_id, node in list(workflow.items()):
             class_type = node.get("class_type")
             inputs = node.get("inputs", {})
             meta = node.get("_meta") or {}
             name = meta.get("deadline_item")
-            if class_type == "LoadImageDataSetFromFolder" and name:
-                # Load just the task's image. Load Image has the same first output.
-                files = meta["deadline_files"]
-                index = item(name, len(files), f"The folder of node {node_id}")
+            if class_type in VALUE_NODES and "deadline_preview" not in meta:
+                fail(f"Node {node_id} is a {class_type} node that the ComfyUI Submitter didn't prepare.")
+            # Replace the value nodes, so the worker doesn't need them installed.
+            if class_type == "DeadlineIntegerValues" and "deadline_values" in meta:
+                # A paired node's task parameter is an item number, since OpenJD sorts a range of
+                # numbers, which would break the pairing.
+                numbers = meta["deadline_values"]
+                index = item(name, len(numbers), f"Deadline Integer Values #{node_id}")
+                replace_node(node_id, numbers[index - 1] if index else meta["deadline_preview"])
+            elif class_type == "DeadlineIntegerValues":
+                # An unpaired node's task parameter is the number itself, which can be negative.
+                found.add(name)
+                values.add(name)
+                replace_node(node_id, ITEMS[name] if name in ITEMS else meta["deadline_preview"])
+            elif class_type == "DeadlineStringValues":
+                # The submitter lists the node's lines, as it counted them.
+                lines = meta["deadline_values"]
+                index = item(name, len(lines), f"Deadline String Values #{node_id}")
+                replace_node(node_id, lines[index - 1] if index else meta["deadline_preview"])
+            elif class_type in ("DeadlineImageValues", "LoadImageDataSetFromFolder"):
+                # Load just the task's image. Load Image has the same first output. A folder loader
+                # that isn't split loads its whole folder.
+                files = meta.get("deadline_files", [])
+                index = item(name, len(files), f"The folder of node {node_id}") if name else 0
                 if index:
                     node.update(class_type="LoadImage", inputs={"image": files[index - 1]})
+                elif class_type == "DeadlineImageValues":
+                    node.update(class_type="LoadImage", inputs={"image": meta["deadline_preview"]})
             elif class_type == "CreateList" and name:
                 # The node takes its items from inputs named input0, input1 and so on, in order.
                 items = sorted(
@@ -453,7 +488,9 @@ steps:
             fail(f"The workflow has no node for {', '.join(missing)}, so it can't select their items.")
 
         # Add the task's items to output file names so tasks don't overwrite each other.
-        chosen_items = {name: value for name, value in ITEMS.items() if value}
+        chosen_items = {
+            name: value for name, value in ITEMS.items() if value or name in values
+        }
         prefix_suffix = "".join(f"_{name}-{value}" for name, value in chosen_items.items())
         # File names are at most 255 bytes, so long list names give way to the item numbers alone.
         if len(prefix_suffix) > 100:

@@ -412,6 +412,7 @@ def test_plan_lists_parameters_task_lists_and_attachments(comfy, monkeypatch):
             "values": ["0", "1", "2", "3"],
             "count": 4,
             "range": "1-4",
+            "pairWith": "",
         }
     ]
     assert body["attachments"] == {"filenames": [str(input_dir / "fox.png")], "directories": []}
@@ -2132,6 +2133,38 @@ def test_bad_parameter_values_are_refused_before_anything_is_staged(
     assert not (comfy.tmp_path / "user" / "deadline_submissions").exists()
 
 
+def test_jobs_attaches_each_lora_of_a_string_values_node(comfy, monkeypatch):
+    """Each line of a Deadline String Values node feeding a LoRA name is a model to attach."""
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    loras = comfy.tmp_path / "models" / "loras"
+    loras.mkdir(parents=True)
+    for name in ("one.safetensors", "two.safetensors"):
+        (loras / name).write_bytes(name.encode())
+    comfy.routes.folder_paths.folder_names_and_paths["loras"] = ([str(loras)], {".safetensors"})
+    workflow = {
+        **WORKFLOW,
+        "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "base.safetensors"}},
+        "10": {
+            "class_type": "DeadlineStringValues",
+            "inputs": {"values": "one.safetensors\ntwo.safetensors\n", "preview_item": 1},
+        },
+        "11": {
+            "class_type": "LoraLoader",
+            "inputs": {"lora_name": ["10", 0], "model": ["4", 0], "clip": ["4", 1]},
+        },
+    }
+    checkpoint = comfy.tmp_path / "models" / "checkpoints" / "base.safetensors"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"model")
+    status, body = run(post(comfy, {"workflow": workflow}))
+    assert status == 202
+    bundle = Path(body["job_bundle"])
+    for name in ("one.safetensors", "two.safetensors"):
+        assert (bundle / "local_models" / "loras" / name).is_file()
+    assert sent_parameters(requests)["ModelDirectory"] == str(bundle / "local_models")
+    assert body["warnings"] == []
+
+
 def _task_parameters(bundle_dir: Path) -> list[str]:
     template = yaml.safe_load((bundle_dir / "template.yaml").read_text())
     space = template["steps"][0]["parameterSpace"]["taskParameterDefinitions"]
@@ -2160,12 +2193,12 @@ def test_jobs_runs_list_items_as_tasks(comfy, monkeypatch):
 def test_jobs_runs_lists_of_different_lengths_as_separate_task_parameters(comfy, monkeypatch):
     workflow = {
         **WORKFLOW,
-        "10": {"class_type": "CreateList", "inputs": {"input0": 1, "input1": 2, "input2": 3}},
+        "10": {"class_type": submit.STRING_NODE, "inputs": {"values": "a\nb\nc"}},
         "11": {"class_type": "CreateList", "inputs": {"input0": ["1", 0], "input1": ["2", 0]}},
     }
     fake_tools(monkeypatch, comfy.tmp_path)
     _, body = run(post(comfy, {"workflow": workflow, "splitTasks": True}))
-    assert _task_parameters(Path(body["job_bundle"])) == ["List10", "List11"]
+    assert _task_parameters(Path(body["job_bundle"])) == ["String10", "List11"]
     assert not any("different numbers of items" in warning for warning in body["warnings"])
 
 
@@ -2310,3 +2343,163 @@ def test_templates_with_their_own_task_parameters_dont_warn_without_lists(comfy,
     status, plan = run(call(comfy, "/deadline/plan", {"workflow": WORKFLOW, "name": "fox"}))
     assert status == 200
     assert not any("task parameters" in warning for warning in plan["warnings"])
+
+
+def test_jobs_rejects_value_nodes_the_job_cant_run(comfy, monkeypatch):
+    fake_tools(monkeypatch, comfy.tmp_path)
+    workflow = {**WORKFLOW, "10": {"class_type": submit.STRING_NODE, "inputs": {"values": ""}}}
+    status, body = run(post(comfy, {"workflow": workflow}))
+    assert status == 400
+    assert body["error"] == "Deadline String Values #10 has no values."
+
+
+def test_plan_doesnt_attach_this_extension_for_its_value_nodes(comfy, monkeypatch):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    extension = write_pack(comfy.tmp_path / "custom_nodes" / "deadline-cloud-for-comfyui")
+    fake_nodes(
+        monkeypatch,
+        {"DeadlineIntegerValues": "custom_nodes.deadline-cloud-for-comfyui.nodes"},
+        {"deadline-cloud-for-comfyui": extension},
+    )
+    workflow = {
+        **WORKFLOW,
+        "5": {
+            "class_type": "DeadlineIntegerValues",
+            "inputs": {"values": "1-2", "preview_item": 1, "pair_with": ""},
+        },
+    }
+    status, body = run(call(comfy, "/deadline/plan", {"workflow": workflow, "name": "fox"}))
+    assert status == 200
+    assert body["localNodes"] == []
+    assert body["nodeWarnings"] == []
+
+
+def _value_node_and_list():
+    return {
+        **WORKFLOW,
+        "10": {"class_type": submit.STRING_NODE, "inputs": {"values": "a\nb\nc"}},
+        "11": {"class_type": "CreateList", "inputs": {"input0": 1, "input1": 2}},
+    }
+
+
+def test_value_nodes_run_as_tasks_in_a_one_task_job(comfy, monkeypatch):
+    """In ComfyUI a value node outputs only its preview item, so it splits even in One task."""
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    parameters = {"String10Items": "2-3", "List11Items": "1-2"}
+    body = {"workflow": _value_node_and_list(), "parameters": parameters}
+    status, response = run(post(comfy, body))
+    assert status == 202, response
+    assert _task_parameters(Path(response["job_bundle"])) == ["String10"]
+    sent = sent_parameters(requests)
+    assert sent["String10Items"] == "2-3"
+    assert "List11Items" not in sent
+
+
+@pytest.mark.parametrize(
+    ("node", "value", "error"),
+    [
+        (submit.INTEGER_NODE, "7,42,-3", None),
+        (submit.INTEGER_NODE, "0", None),
+        (submit.INTEGER_NODE, "x", "Deadline Integer Values #10: 'x' isn't a number"),
+        # A value node has no whole list to run.
+        (submit.STRING_NODE, "0", "Deadline String Values #10: use item numbers"),
+    ],
+)
+def test_jobs_check_value_nodes_fields(comfy, monkeypatch, node, value, error):
+    """An Integer Values field holds its numbers, and other fields hold item numbers from 1."""
+    fake_tools(monkeypatch, comfy.tmp_path)
+    values = "1-3" if node == submit.INTEGER_NODE else "a\nb"
+    workflow = {**WORKFLOW, "10": {"class_type": node, "inputs": {"values": values}}}
+    parameter = "Integer10Items" if node == submit.INTEGER_NODE else "String10Items"
+    status, response = run(post(comfy, {"workflow": workflow, "parameters": {parameter: value}}))
+    if error is None:
+        assert status == 202, response
+    else:
+        assert status == 400
+        assert response["error"].startswith(error)
+
+
+@pytest.mark.parametrize(
+    ("value", "error"),
+    [
+        ("", "Deadline Integer Values #10: add the numbers to run"),
+        (",".join(str(n) for n in range(0, 600, 2)), "the field is longer than 1024 characters"),
+    ],
+)
+def test_jobs_refuse_an_empty_or_long_integer_values_field(comfy, monkeypatch, value, error):
+    """OpenJD would refuse either, after the files were staged and with a less helpful message."""
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    workflow = {**WORKFLOW, "10": {"class_type": submit.INTEGER_NODE, "inputs": {"values": "1-3"}}}
+    body = {"workflow": workflow, "parameters": {"Integer10Items": value}}
+    status, response = run(post(comfy, body))
+    assert status == 400
+    assert error in response["error"]
+    assert not requests.exists()
+
+
+def test_jobs_refuse_paired_fields_with_different_numbers_of_items(comfy, monkeypatch):
+    """OpenJD runs paired task parameters together, so they need the same number of items."""
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    workflow = {
+        **WORKFLOW,
+        "10": {"class_type": submit.STRING_NODE, "inputs": {"values": "a\nb\nc", "pair_with": "p"}},
+        "11": {"class_type": submit.STRING_NODE, "inputs": {"values": "x\ny\nz", "pair_with": "p"}},
+    }
+    parameters = {"String10Items": "2,3", "String11Items": "1-3"}
+    status, response = run(post(comfy, {"workflow": workflow, "parameters": parameters}))
+    assert status == 400
+    assert response["error"] == (
+        "Paired fields need the same number of items: Deadline String Values #10 has 2, "
+        "Deadline String Values #11 has 3."
+    )
+    assert not requests.exists()
+    parameters["String11Items"] = "1,3"
+    status, response = run(post(comfy, {"workflow": workflow, "parameters": parameters}))
+    assert status == 202, response
+
+
+def test_templates_that_cant_select_items_refuse_value_nodes(comfy, monkeypatch):
+    """The worker couldn't run the value nodes, since the extension isn't attached."""
+    use_basic_template(comfy, monkeypatch)
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    workflow = {**WORKFLOW, "10": {"class_type": submit.STRING_NODE, "inputs": {"values": "a"}}}
+    status, response = run(call(comfy, "/deadline/plan", {"workflow": workflow, "name": "fox"}))
+    assert status == 400
+    assert "studio.yaml can't run Deadline value nodes" in response["error"]
+
+
+def test_plan_previews_each_string_value_by_its_first_line(comfy, monkeypatch):
+    """A value split at lines of --- can be a prompt with paragraphs."""
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    values = "a red fox\n---\na cat at dawn.\n\nSoft light.\n---\nan owl"
+    node = {"values": values, "split_by": submit.SPLIT_BY_SEPARATOR}
+    workflow = {**WORKFLOW, "10": {"class_type": submit.STRING_NODE, "inputs": node}}
+    status, body = run(call(comfy, "/deadline/plan", {"workflow": workflow, "name": "fox"}))
+    assert status == 200
+    [source] = body["sources"]
+    assert source["values"] == ["a red fox", "a cat at dawn. …", "an owl"]
+    assert source["count"] == 3
+
+
+def test_value_nodes_feeding_a_node_with_a_bad_meta_get_a_400(comfy, monkeypatch):
+    """Naming a value node's field reads the _meta of the node it feeds."""
+    fake_tools(monkeypatch, comfy.tmp_path)
+    workflow = {
+        "1": {"class_type": submit.STRING_NODE, "inputs": {"values": "a\nb"}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"text": ["1", 0]}, "_meta": "x"},
+    }
+    status, response = run(call(comfy, "/deadline/plan", {"workflow": workflow, "name": "x"}))
+    assert (status, response["error"]) == (400, "Node 2 has a _meta that isn't an object.")
+
+
+def test_templates_with_their_own_task_parameters_refuse_value_nodes(comfy, monkeypatch):
+    """Value nodes have to run as tasks, which such a template's step can't take."""
+    _studio_step_with_task_parameters(comfy, monkeypatch)
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    workflow = {**WORKFLOW, "10": {"class_type": submit.STRING_NODE, "inputs": {"values": "a"}}}
+    status, response = run(call(comfy, "/deadline/plan", {"workflow": workflow, "name": "fox"}))
+    assert status == 400
+    assert response["error"].startswith(
+        "The job template studio.yaml can't run Deadline value nodes: its step already has task "
+        "parameters."
+    )

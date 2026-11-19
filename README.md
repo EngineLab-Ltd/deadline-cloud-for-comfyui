@@ -198,33 +198,66 @@ uploaded from this machine:
 A workflow runs as one task by default, as ComfyUI does locally, with each list's items in that
 task. To run them as separate tasks, choose **Multiple tasks** in the panel's **Tasks** section. The
 submitter then gives each source of items below a task parameter and a field, and the job runs a
-task for each combination of them:
+task for each combination of them. The Deadline value nodes always run their items as separate
+tasks, since that's what they're for, so a workflow with one doesn't need **Multiple tasks**:
 
 | In the workflow | One task per | Field by default |
 |---|---|---|
-| **Create List** | Item wired into it | Every item, such as `1-3` |
+| **Deadline String Values** node | Line of text, or text between lines of `---` | Every value, such as `1-3` |
+| **Deadline Integer Values** node | Number, such as `1-100`, `1-20:2` or `7, 42, 99` | The node's numbers |
+| **Deadline Image Values** node | Image in a folder of ComfyUI's input directory, in name order | Every image |
+| **Create List** | Item wired into it | Every item |
 | **Load Image (from Folder)** | Image in its folder, in name order | Every image |
 
-Each combination of the fields runs as one task. A Create List with 3 items and a folder of 4 images
-make 12 tasks. The panel shows the count as you change them, such as "3 × 4 = 12 tasks". Lists can
-have different numbers of items. Each task adds its items to the Save nodes' file names, such as
-`_List64-3_Folder7-2`. A split folder's task loads its one image with **Load Image**, which applies
-the image's EXIF rotation and loads every frame of an animated image, unlike the folder loader.
+Each combination of the fields runs as one task. A Create List with 3 items and a Deadline Integer
+Values node with `1-4` make 12 tasks. The panel shows the count as you change them, such as
+"3 × 4 = 12 tasks". Lists can have different numbers of items. Each task adds its items to the Save
+nodes' file names, such as `_List64-3_Seed-42`. A split folder's task loads its one image with
+**Load Image**, which applies the image's EXIF rotation and loads every frame of an animated image,
+unlike the folder loader.
 
-In the panel, narrow a field to run only some of its items, such as `2,3`, or set it to `0` to run
-that list whole in each task while the other lists split. A step can have at most
-16 task parameters. Lists past the first 16 run whole in one task, and the panel warns about them.
+In the panel, narrow a field to run only some of its items, such as `2,3`. Set a Create List's or
+folder's field to `0` to run that list whole in each task while the other lists split. A step can
+have at most 16 task parameters. Value nodes take the first of them, and a workflow can have at most
+16 value nodes with more than one item. Lists and folders past the first 16 fields run whole in one
+task, and the panel warns about them.
 The number in a label such as **Create List #64** is the node's ID, which ComfyUI shows with
 **Settings > Lite Graph > Node ID badge**. Lists that a workflow builds while it runs, such as
 Rebatch Images, always run whole in one task, because Deadline Cloud sets a job's tasks when you
 submit it. Wire single values, such as prompts or numbers, into a Create List. If one of its inputs
 is a list itself, ComfyUI runs each of that list's items, so the panel's count is wrong.
 
-Each list's task parameter is named after its node: `List64` for Create List #64, or `Folder7` for
-a folder loader. Rename the node, such as to **Subject**, and that name is used instead: the
-**Subject** column in Deadline Cloud monitor, the **SubjectItems** job parameter and the
-`_Subject-2` suffix on output files. A list whose name another list already has gets its node ID
-added, such as `Subject_70`.
+Each list's task parameter is named after its node: `List64` for Create List #64, `Folder7` for a
+folder loader or `Integer5` for Deadline Integer Values #5. Rename the node, such as to **Subject**,
+and that name is used instead: the **Subject** column in Deadline Cloud monitor, the
+**SubjectItems** job parameter and the `_Subject-2` suffix on output files. A list whose name
+another list already has gets its node ID added, such as `Subject_70`.
+
+The value nodes connect to any input of their type: a prompt or LoRA name, a seed or steps, an
+image. In ComfyUI each outputs its **preview_item**. The job replaces each with the task's value, so
+workers don't need this extension. An Integer node's field holds its numbers, so Deadline Cloud
+monitor shows each task's number. Other fields hold item numbers, and so does a paired Integer
+node's, so that its numbers stay in the order you typed them. Each value of a String Values node
+that's a model file, such as one LoRA per task, is attached like any other model.
+
+A String Values node takes one value per line. For values longer than a line, such as prompts with
+paragraphs, set its **split_by** to `--- lines` and put a line of `---` between the values:
+
+```
+a red fox in the snow
+---
+a cat on a windowsill at dawn.
+
+Soft light, film grain.
+```
+
+The panel previews each value by its first line.
+
+To run value nodes' items together rather than in every combination, give them the same
+**pair_with**, such as a prompt list and a LoRA list that go together. Paired nodes need the same
+number of items, and each task runs the items at one position across the paired lists. A paired
+Integer node can repeat a number, such as Width `768,512,512` paired with Height `512,512,768`.
+Paired nodes with different numbers of items run every combination, with a warning.
 
 ## Host requirements
 

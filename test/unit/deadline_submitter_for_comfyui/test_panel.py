@@ -246,3 +246,32 @@ def test_list_fields_take_the_same_ranges_as_the_submitter(run_scenario):
     """item_ranges.json is shared with test_submit.py, so the panel and the submitter agree."""
     cases = json.loads((PANEL / "item_ranges.json").read_text())
     assert run_scenario("item-range-contract")["counts"] == [case["count"] for case in cases]
+
+
+def test_paired_value_nodes_count_once_and_send_their_ranges(run_scenario):
+    result = run_scenario("value-pairs")
+    # OpenJD ranges, as the job's task parameters take them. "0" runs a list whole, as one item.
+    assert result["counts"] == [4, 10, 3, None, None, 1, None]
+    # Paired fields count once: 3 frame sizes × 4 seeds.
+    assert result["tasks"] == 12
+    assert result["pairErrors"] == [
+        "Paired fields need the same number of items: Width has 3, Height has 2.",
+        None,
+    ]
+    # 0 is a number, such as a seed, and numbers have at most 20 digits, as in the submitter.
+    assert result["integerCounts"] == [3, 1, 2, None, None]
+    # A value node has no whole list to run, so "0" isn't one of its items.
+    assert result["previews"] == ["b, c, d, …", "", ""]
+    assert result["canSubmitBadRange"] is False
+    assert result["canSubmit"] is True
+    assert result["parameters"] == {"WidthItems": "1-3", "HeightItems": "1-3", "SeedItems": "1-2"}
+
+
+def test_value_nodes_run_as_tasks_when_the_workflow_runs_as_one(run_scenario):
+    """In ComfyUI a value node outputs only its preview item, so One task only covers the lists."""
+    result = run_scenario("value-node-one-task")
+    assert result["split"] is False
+    assert result["splitsSource"] == [True, False]
+    assert result["tasks"] == 3
+    assert result["parameters"] == {"String10Items": "1-3"}
+    assert result["splitTasks"] is False

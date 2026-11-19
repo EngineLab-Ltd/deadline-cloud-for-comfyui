@@ -42,12 +42,15 @@ from .submit import (
     DEFAULT_WORKFLOW_NAME,
     FOLDER_LOADERS,
     PICKER_KINDS,
+    VALUE_NODES,
+    ItemSource,
     SubmitError,
     TaskLists,
     check_cli_version,
     check_item_range,
     check_parameter_values,
     create_job_bundle,
+    first_line,
     host_requirements,
     input_folders,
     job_description,
@@ -187,14 +190,15 @@ def _installed_node_packs(workflow: dict[str, Any]) -> _InstalledNodes:
     """
     Finds the custom node pack, and its folder, that ComfyUI loaded each workflow node from.
     Both the legacy NODE_CLASS_MAPPINGS packs and V3 extension packs (a comfy_entrypoint that
-    returns a ComfyExtension) are found.
+    returns a ComfyExtension) are found. The value nodes are left out: the job replaces them, so
+    workers don't need this extension.
     """
     installed = _InstalledNodes()
     try:
         import nodes
     except ImportError:
         return installed
-    for class_type in {node["class_type"] for node in workflow.values()}:
+    for class_type in {node["class_type"] for node in workflow.values()} - set(VALUE_NODES):
         name = _custom_node_pack_name(nodes.NODE_CLASS_MAPPINGS.get(class_type))
         if name is None:
             continue
@@ -420,6 +424,20 @@ def _prepare(
             if isinstance(parameter, dict)
         }
         items = plan_task_lists(workflow, input_dir, reserved)
+    # The task script replaces value nodes, and the extension that defines them isn't attached.
+    if items is None and any(
+        isinstance(node, dict) and node.get("class_type") in VALUE_NODES
+        for node in workflow.values()
+    ):
+        reason = (
+            "its step already has task parameters"
+            if template_has_own_task_parameters(template)
+            else "its task script doesn't select each task's items"
+        )
+        raise SubmitError(
+            f"The job template {template.name} can't run Deadline value nodes: {reason}. Use the "
+            "submitter's job template, or remove the value nodes."
+        )
     prepared = _Prepared(
         workflow=items.workflow if items else workflow,
         items=items,
@@ -684,11 +702,18 @@ def _plan(body: dict[str, Any], workflow: dict[str, Any], template: Path) -> dic
                 "label": source.label,
                 "title": source.title,
                 "kind": source.kind,
-                "values": [
-                    value[:MAX_PREVIEW_LENGTH] for value in source.values[:MAX_PREVIEW_VALUES]
-                ],
+                # Integer fields hold the values themselves, so they need no preview.
+                "values": (
+                    []
+                    if source.kind == "integer"
+                    else [
+                        first_line(value)[:MAX_PREVIEW_LENGTH]
+                        for value in source.values[:MAX_PREVIEW_VALUES]
+                    ]
+                ),
                 "count": source.count,
                 "range": source.range,
+                "pairWith": source.pair_with,
             }
             for source in sources
         ],
@@ -882,6 +907,22 @@ def _attaches_nodes(definitions: list[Any], parameters: dict[str, Any]) -> bool:
     return parse_bool(value) is not False
 
 
+def _check_paired_counts(sources: list[ItemSource], counts: dict[str, int]) -> None:
+    """
+    Checks that paired fields run the same number of items, which OpenJD needs to run them
+    together. The panel checks this too, so this catches a request from elsewhere. Raises
+    SubmitError.
+    """
+    pairs: dict[str, list[ItemSource]] = {}
+    for source in sources:
+        if source.pair_with:
+            pairs.setdefault(source.pair_with, []).append(source)
+    for paired in pairs.values():
+        if len({counts[source.name] for source in paired}) > 1:
+            items = ", ".join(f"{source.title} has {counts[source.name]}" for source in paired)
+            raise SubmitError(f"Paired fields need the same number of items: {items}.")
+
+
 async def _build_bundle(
     body: dict[str, Any],
     workflow: dict[str, Any],
@@ -902,23 +943,28 @@ async def _build_bundle(
     # Refused before anything is prepared, staged or copied for the job.
     check_parameter_values(definitions, parameters)
 
-    # The panel splits the workflow's lists into tasks only when the artist chooses to. Otherwise
-    # the job is one task, with no task parameters, and the lists run whole in it.
+    # The panel splits the workflow's lists and folders into tasks only when the artist chooses to.
+    # Otherwise they run whole. Value nodes run their items as tasks either way, since in ComfyUI
+    # they output only their preview item.
     split = body.get("splitTasks", False)
     if not isinstance(split, bool):
         raise SubmitError("splitTasks must be true or false.")
 
     prepared = await asyncio.to_thread(_prepare, body, workflow, template, config)
-    items = prepared.items if split else None
-    sources = items.active if items else None
-    # One task has no list parameters, such as ones from a panel loaded before One task was the
-    # default.
-    for source in prepared.items.sources if prepared.items and not split else []:
-        parameters.pop(source.parameter, None)
-    if items:
+    items = prepared.items
+    sources = [s for s in items.active if split or s.value_node] if items else []
+    # Lists that run whole have no parameters, such as ones from a panel loaded before One task was
+    # the default.
+    for source in items.sources if items and not split else []:
+        if not source.value_node:
+            parameters.pop(source.parameter, None)
+    if items and sources:
         prepared.warnings = [*items.warnings, *prepared.warnings]
-    for source in sources or []:
-        check_item_range(source, parameters.get(source.parameter, source.range))
+    counts = {
+        source.name: check_item_range(source, parameters.get(source.parameter, source.range))
+        for source in sources
+    }
+    _check_paired_counts(sources, counts)
     defined = {
         parameter.get("name")
         for parameter in read_job_template(template, sources).get("parameterDefinitions", [])
@@ -926,7 +972,7 @@ async def _build_bundle(
     # A list's field from an older plan, such as before the list was renamed, before anything is
     # staged. Queue parameters aren't in the template, but don't end in "Items".
     stale = sorted(name for name in parameters if name.endswith("Items") and name not in defined)
-    if split and stale:
+    if sources and stale:
         raise SubmitError(
             f"The workflow's lists changed since it was read ({', '.join(stale)}). Read the "
             "workflow again, then choose their items."

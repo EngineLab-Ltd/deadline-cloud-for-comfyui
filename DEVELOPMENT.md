@@ -21,6 +21,7 @@ npm ci
 | `__init__.py` | The ComfyUI custom-node entry point. ComfyUI imports it from `custom_nodes/`. |
 | `install_submitter.py` | The setup script for users. It's tested in `test/unit/test_install_submitter.py`. |
 | `src/deadline/comfyui_submitter/submit.py` | Pure helpers for building the submitter command. They don't import ComfyUI, so they're unit tested. |
+| `src/deadline/comfyui_submitter/nodes.py` | The Deadline value nodes, which list values to run as separate tasks. The job's task script replaces them, so workers don't need this extension. |
 | `src/deadline/comfyui_submitter/routes.py` | The `/deadline/...` routes on the ComfyUI server: `plan`, `cloud/<command>`, `jobs`, `jobs/download`, `bundle` and `choose`. |
 | `src/deadline/comfyui_submitter/bridge.py` | Calls `deadline.client.api` for the routes. It runs in the Deadline Cloud CLI's Python (`python -I bridge.py <command>`) and speaks JSON lines, so it only imports the standard library and `deadline`. |
 | `frontend/src/extensions/deadline-cloud/` | The frontend extension's TypeScript. `deadline_submit.ts` registers the commands, the action bar button and the sidebar tab; `deadline_ui.ts` is the panel and the dialog, in plain DOM with ComfyUI's theme variables. The folder mirrors where ComfyUI serves the extension, so imports such as `../../scripts/app.js` resolve to the type declarations in `frontend/src/scripts/`. |
@@ -80,6 +81,15 @@ a running ComfyUI, so test them by hand:
    that the job runs as one task with all three prompts. Then choose **Multiple tasks**
    under **Tasks**, and check that it shows 3 tasks, that the job runs 3, and that each output's
    name ends with its item, such as `_List5-2`. Set the field to `2,3` and check that it runs 2.
+7. Add a **Deadline Integer Values** node with `1-3` to a text-to-image workflow's seed, and a
+   **Deadline String Values** node with two prompts. Check that **Tasks** shows "2 × 3 = 6
+   tasks" without a choice of One task or Multiple tasks, that the job runs 6 tasks, and that
+   each output's name ends with its items, such as `_String5-2_Integer6-3`. Then give both a
+   pair_with such as `look`, with two numbers, and check that the job runs 2 tasks. Add the
+   Create List from step 6, and check that **One task** runs it whole in each of those tasks.
+8. Set the String Values node's **split_by** to `--- lines`, and give it two prompts of two
+   paragraphs each, with a line of `---` between them. Check that **Tasks** previews each prompt
+   by its first line, and that each task's prompt keeps both of its paragraphs.
 
 To exercise the routes without the frontend:
 

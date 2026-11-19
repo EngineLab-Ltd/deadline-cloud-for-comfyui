@@ -435,37 +435,112 @@ def test_fails_when_a_tasks_list_has_no_node(tmp_path):
     assert ran == {}
 
 
-def _images(name="Cats"):
-    meta: dict[str, Any] = {submit.FILES_META: ["cats/a.png", "cats/b.png"]}
+def _string_values(values="a red fox\nlora_b.safetensors\n\nlast", name="Words"):
+    # The submitter lists the lines, as plan_task_lists does.
+    meta = {
+        submit.PREVIEW_META: "lora_b.safetensors",
+        submit.VALUES_META: submit.string_values(values),
+    }
     if name:
         meta[submit.ITEM_META] = name
     return {
-        "3": {
-            "class_type": "LoadImageDataSetFromFolder",
-            "inputs": {"folder": "cats"},
-            "_meta": meta,
-        }
+        "5": {"class_type": submit.STRING_NODE, "inputs": {"values": values}, "_meta": meta},
+        "7": {"class_type": "LoraLoader", "inputs": {"lora_name": ["5", 0], "model": ["4", 0]}},
     }
 
 
-def test_folders_load_the_tasks_image(tmp_path):
-    _, _, ran = run_task(tmp_path, _images(), {"Cats": 1})
+@pytest.mark.parametrize(
+    ("items", "value"), [({"Words": 0}, "lora_b.safetensors"), ({"Words": 3}, "last")]
+)
+def test_string_values_are_replaced_by_the_tasks_value(tmp_path, items, value):
+    code, output, ran = run_task(tmp_path, _string_values(), items)
+    assert code == 0, output
+    assert "5" not in ran
+    assert ran["7"]["inputs"] == {"lora_name": value, "model": ["4", 0]}
+
+
+def test_string_values_that_arent_split_output_the_preview(tmp_path):
+    code, output, ran = run_task(tmp_path, _string_values(name=None), {})
+    assert code == 0, output
+    assert ran["7"]["inputs"]["lora_name"] == "lora_b.safetensors"
+
+
+def test_string_values_past_the_end(tmp_path):
+    code, output, _ = run_task(tmp_path, _string_values(), {"Words": 4})
+    assert code == 1
+    assert "Item 4 of Words doesn't exist. Deadline String Values #5 has 3 items." in output
+
+
+def _integer_values(name="Seed"):
+    meta = {submit.PREVIEW_META: 7}
+    if name:
+        meta[submit.ITEM_META] = name
+    return {
+        "15": {"class_type": submit.INTEGER_NODE, "inputs": {"values": "7, 0-2"}, "_meta": meta},
+        "16": {"class_type": "KSampler", "inputs": {"seed": ["15", 0], "steps": 20}},
+        "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "fox"}},
+    }
+
+
+def test_integer_values_are_replaced_by_the_tasks_value(tmp_path):
+    code, output, ran = run_task(tmp_path, _integer_values(), {"Seed": 0})
+    assert code == 0, output
+    assert ran["16"]["inputs"] == {"seed": 0, "steps": 20}
+    # A value of 0 still goes in the file names.
+    assert ran["9"]["inputs"]["filename_prefix"] == "fox_Seed-0"
+
+
+def test_integer_values_that_arent_split_output_the_preview(tmp_path):
+    _, _, ran = run_task(tmp_path, _integer_values(name=None), {})
+    assert ran["16"]["inputs"]["seed"] == 7
+    assert ran["9"]["inputs"]["filename_prefix"] == "fox"
+
+
+def test_value_nodes_need_the_submitter(tmp_path):
+    workflow = _integer_values()
+    del workflow["15"]["_meta"]
+    code, output, _ = run_task(tmp_path, workflow, {})
+    assert code == 1
+    assert "DeadlineIntegerValues node that the ComfyUI Submitter didn't prepare" in output
+
+
+def _images(class_type, name="Cats"):
+    meta: dict[str, Any] = {submit.FILES_META: ["cats/a.png", "cats/b.png"]}
+    if class_type == submit.IMAGE_NODE:
+        meta[submit.PREVIEW_META] = "cats/b.png"
+    if name:
+        meta[submit.ITEM_META] = name
+    return {"3": {"class_type": class_type, "inputs": {"folder": "cats"}, "_meta": meta}}
+
+
+@pytest.mark.parametrize("class_type", [submit.IMAGE_NODE, "LoadImageDataSetFromFolder"])
+def test_folders_load_the_tasks_image(tmp_path, class_type):
+    _, _, ran = run_task(tmp_path, _images(class_type), {"Cats": 1})
     assert ran["3"]["class_type"] == "LoadImage"
     assert ran["3"]["inputs"] == {"image": "cats/a.png"}
 
 
+def test_image_values_that_arent_split_load_the_preview(tmp_path):
+    for items in ({"Cats": 0}, {}):
+        _, _, ran = run_task(tmp_path, _images(submit.IMAGE_NODE, name=None), items)
+        assert ran["3"]["inputs"] == {"image": "cats/b.png"}
+
+
 def test_folder_loaders_that_arent_split_load_the_whole_folder(tmp_path):
-    _, _, ran = run_task(tmp_path, _images(), {"Cats": 0})
+    _, _, ran = run_task(tmp_path, _images("LoadImageDataSetFromFolder"), {"Cats": 0})
     assert ran["3"]["class_type"] == "LoadImageDataSetFromFolder"
 
 
 def test_each_source_selects_its_own_item(tmp_path):
-    workflow = {**_create_list(), **_images()}
-    code, output, ran = run_task(tmp_path, workflow, {"List1": 2, "Cats": 1})
+    workflow = {**_create_list(), **_string_values(), **_integer_values()}
+    workflow["9"]["inputs"]["filename_prefix"] = "fox"
+    items = {"List1": 2, "Words": 1, "Seed": 42}
+    code, output, ran = run_task(tmp_path, workflow, items)
     assert code == 0, output
     assert ran["1"]["inputs"] == {"inputs.input0": ["3", 0]}
-    assert ran["3"]["inputs"] == {"image": "cats/a.png"}
-    assert ran["9"]["inputs"]["filename_prefix"] == "fox_List1-2_Cats-1"
+    assert ran["7"]["inputs"]["lora_name"] == "a red fox"
+    assert ran["16"]["inputs"] == {"seed": 42, "steps": 20}
+    assert ran["9"]["inputs"]["filename_prefix"] == "fox_List1-2_Words-1_Seed-42"
 
 
 def test_a_wired_prefix_gets_the_tasks_items_through_concatenate_text(tmp_path):
@@ -526,3 +601,61 @@ def test_long_list_names_give_way_to_item_numbers_in_file_names(tmp_path):
     assert code == 0, output
     assert ran["9"]["inputs"]["filename_prefix"] == "fox_items-2-2-2-2-2"
     assert f"Output files end in _items-2-2-2-2-2, for {', '.join(names)}." in output
+
+
+def test_string_values_run_the_lines_the_submitter_counted(tmp_path):
+    """The task script takes the submitter's lines, so a U+2028 inside a line stays in it."""
+    values = "a red\u2028fox\r\nlora_b.safetensors\n"
+    workflow = {
+        "5": {"class_type": submit.STRING_NODE, "inputs": {"values": values}},
+        "7": {"class_type": "LoraLoader", "inputs": {"lora_name": ["5", 0], "model": ["4", 0]}},
+    }
+    plan = submit.plan_task_lists(workflow)
+    [source] = plan.active
+    assert source.count == 2
+    for item, line in ((1, "a red\u2028fox"), (2, "lora_b.safetensors")):
+        task_dir = tmp_path / str(item)
+        task_dir.mkdir()
+        code, output, ran = run_task(task_dir, plan.workflow, {source.name: item})
+        assert code == 0, output
+        assert ran["7"]["inputs"]["lora_name"] == line
+
+
+def test_string_values_split_at_separator_lines_keep_their_paragraphs(tmp_path):
+    values = "a red fox\n---\na cat at dawn.\n\nSoft light.\n"
+    workflow = {
+        "5": {
+            "class_type": submit.STRING_NODE,
+            "inputs": {"values": values, "split_by": submit.SPLIT_BY_SEPARATOR},
+        },
+        "7": {"class_type": "CLIPTextEncode", "inputs": {"text": ["5", 0]}},
+    }
+    plan = submit.plan_task_lists(workflow)
+    [source] = plan.active
+    code, output, ran = run_task(tmp_path, plan.workflow, {source.name: 2})
+    assert code == 0, output
+    assert ran["7"]["inputs"]["text"] == "a cat at dawn.\n\nSoft light."
+
+
+def test_paired_integer_values_select_their_value_by_item_number(tmp_path):
+    meta = {
+        submit.PREVIEW_META: 1024,
+        submit.ITEM_META: "Width",
+        submit.VALUES_META: [1024, 1344, 768],
+    }
+    workflow = {
+        "15": {
+            "class_type": submit.INTEGER_NODE,
+            "inputs": {"values": "1024,1344,768"},
+            "_meta": meta,
+        },
+        "16": {"class_type": "EmptyLatentImage", "inputs": {"width": ["15", 0]}},
+        "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "fox"}},
+    }
+    code, output, ran = run_task(tmp_path, workflow, {"Width": 2})
+    assert code == 0, output
+    assert ran["16"]["inputs"]["width"] == 1344
+    assert ran["9"]["inputs"]["filename_prefix"] == "fox_Width-2"
+    code, output, _ = run_task(tmp_path, workflow, {"Width": 4})
+    assert code == 1
+    assert "Item 4 of Width doesn't exist" in output

@@ -256,13 +256,34 @@ def _is_secret_node_file(name: str) -> bool:
     return any(fnmatch.fnmatch(name, pattern) for pattern in _SECRET_NODE_FILES)
 
 
-def _ignore_node_files(directory: str, names: list[str]) -> set[str]:
+def _ignore_node_files(root: Path, directory: str, names: list[str]) -> set[str]:
+    """
+    The entries of a pack's folder to leave out of the job. root is the pack's folder, resolved.
+    copytree follows symbolic links, so a link is attached only when it points inside the pack, and
+    is checked for credentials by its target's name as well as its own.
+    """
     ignored = set()
     for name in names:
         path = Path(directory, name)
         if name in _SKIPPED_NODE_DIRS or name.endswith(".pyc") or (path / "pyvenv.cfg").is_file():
             ignored.add(name)
-        elif _is_secret_node_file(name) and not path.is_dir():
+            continue
+        target = path.resolve() if path.is_symlink() else path
+        if path.is_symlink() and not target.is_relative_to(root):
+            logger.warning("Leaving %s out of the job: it links outside the pack", path)
+            ignored.add(name)
+        elif (
+            path.is_symlink()
+            and target.is_dir()
+            and Path(directory).resolve().is_relative_to(target)
+        ):
+            logger.warning("Leaving %s out of the job: it links to a folder that holds it", path)
+            ignored.add(name)
+        elif not (path.is_file() or path.is_dir()):
+            # Such as a named pipe, which would block the copy, or a link to nothing.
+            logger.warning("Leaving %s out of the job: it isn't a file or a folder", path)
+            ignored.add(name)
+        elif path.is_file() and (_is_secret_node_file(name) or _is_secret_node_file(target.name)):
             logger.warning("Leaving %s out of the job: it can hold credentials", path)
             ignored.add(name)
     return ignored
@@ -295,10 +316,11 @@ def stage_local_node_packs(packs: Mapping[str, Path], dest: Path) -> dict[str, P
         copied: list[str] = []
         try:
             if source.is_dir():
+                # The pack's own folder can be a link, such as to a checkout elsewhere.
                 shutil.copytree(
                     source,
                     target,
-                    ignore=_ignore_node_files,
+                    ignore=functools.partial(_ignore_node_files, source.resolve()),
                     copy_function=functools.partial(_link_or_copy, copied=copied),
                     ignore_dangling_symlinks=True,
                     dirs_exist_ok=True,

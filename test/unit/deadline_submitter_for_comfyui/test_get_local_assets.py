@@ -1,4 +1,5 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+import os
 import shutil
 from pathlib import Path
 
@@ -571,6 +572,64 @@ def test_stage_local_node_packs_leaves_out_files_that_can_hold_credentials(comfy
     )
     assert files == sorted(kept_files)
     assert "can hold credentials" in caplog.text
+
+
+def _symlink(link: Path, target: Path) -> None:
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(target, target_is_directory=target.is_dir())
+    except OSError:
+        pytest.skip("This system can't create symbolic links.")
+
+
+def _staged_files(dest: Path, name: str) -> list[str]:
+    return sorted(
+        p.relative_to(dest / name).as_posix() for p in (dest / name).rglob("*") if p.is_file()
+    )
+
+
+def test_stage_local_node_packs_keeps_links_inside_the_pack_only(comfy, tmp_path, caplog):
+    """A link's content is attached, so a link out of the pack, or to a credentials file, isn't."""
+    pack = comfy["custom_nodes"] / "linked-nodes"
+    touch(pack / "__init__.py")
+    touch(pack / "data" / "styles.csv")
+    touch(pack / ".env")
+    outside = touch(tmp_path / "home" / "secret.txt")
+    touch(tmp_path / "shared" / "models" / "big.safetensors")
+    _symlink(pack / "notes.txt", outside)
+    _symlink(pack / "models", tmp_path / "shared" / "models")
+    _symlink(pack / "config.txt", pack / ".env")
+    _symlink(pack / "styles.csv", pack / "data" / "styles.csv")
+    _symlink(pack / "data" / "loop", pack)
+    dest = tmp_path / "local_nodes"
+    stage_local_node_packs({"linked-nodes": pack}, dest)
+    assert _staged_files(dest, "linked-nodes") == ["__init__.py", "data/styles.csv", "styles.csv"]
+    assert caplog.text.count("it links outside the pack") == 2
+    assert "config.txt out of the job: it can hold credentials" in caplog.text
+    assert "it links to a folder that holds it" in caplog.text
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="Named pipes are POSIX only.")
+def test_stage_local_node_packs_leaves_out_special_files(comfy, tmp_path, caplog):
+    """Copying a named pipe would wait for a writer forever."""
+    pack = comfy["custom_nodes"] / "pipe-nodes"
+    touch(pack / "__init__.py")
+    os.mkfifo(pack / "events")
+    dest = tmp_path / "local_nodes"
+    stage_local_node_packs({"pipe-nodes": pack}, dest)
+    assert _staged_files(dest, "pipe-nodes") == ["__init__.py"]
+    assert "events out of the job: it isn't a file or a folder" in caplog.text
+
+
+def test_stage_local_node_packs_follows_a_pack_that_is_a_link(comfy, tmp_path):
+    """A pack installed as a link to a checkout elsewhere is attached from the checkout."""
+    checkout = tmp_path / "dev" / "studio-nodes"
+    touch(checkout / "__init__.py")
+    touch(checkout / "nodes" / "fox.py")
+    _symlink(comfy["custom_nodes"] / "studio-nodes", checkout)
+    dest = tmp_path / "local_nodes"
+    stage_local_node_packs({"studio-nodes": comfy["custom_nodes"] / "studio-nodes"}, dest)
+    assert _staged_files(dest, "studio-nodes") == ["__init__.py", "nodes/fox.py"]
 
 
 def test_stage_local_node_packs_warns_when_it_copies_a_file(comfy, tmp_path, monkeypatch, caplog):

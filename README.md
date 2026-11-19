@@ -211,7 +211,8 @@ have different numbers of items. Each task adds its items to the Save nodes' fil
 `_List64-3_Folder7-2`. A split folder's task loads its one image with **Load Image**, which applies
 the image's EXIF rotation and loads every frame of an animated image, unlike the folder loader.
 
-In the panel, narrow a field to run only some of its items, such as `2,3`. A step can have at most
+In the panel, narrow a field to run only some of its items, such as `2,3`, or set it to `0` to run
+that list whole in each task while the other lists split. A step can have at most
 16 task parameters. Lists past the first 16 run whole in one task, and the panel warns about them.
 The number in a label such as **Create List #64** is the node's ID, which ComfyUI shows with
 **Settings > Lite Graph > Node ID badge**. Lists that a workflow builds while it runs, such as

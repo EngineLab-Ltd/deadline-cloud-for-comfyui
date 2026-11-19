@@ -616,6 +616,8 @@ export function workflowLoaded() {
 // Task lists
 
 const RANGE_PART = /^(-?\d+)(?:\s*-\s*(-?\d+)(?:\s*:\s*(\d+))?)?$/;
+// One part of a list's item range, as the submitter's _ITEM_RANGE_PART reads it.
+const ITEM_RANGE_PART = /^\d{1,9}(?:\s*-\s*\d{1,9}(?:\s*:\s*\d{1,9})?)?$/;
 
 interface RangePart {
   start: number;
@@ -694,17 +696,22 @@ function plural(count: number, noun: string) {
 // A field's number of tasks, or null with an error. A field holds item numbers from 1 to the list's
 // count, so the farm never gets an item that doesn't exist. Unsplit, every list counts as one.
 function fieldCount(source: TaskList, value: string): { count: number | null; error: string | null } {
-  if (!splitsTasks()) {
+  // "0" keeps the list whole in each task, as the submitter's check_item_range takes it.
+  if (!splitsTasks() || String(value).trim() === "0") {
     return { count: 1, error: null };
   }
   const parts = parseRange(value);
+  // Item numbers have at most 9 digits, as the submitter reads them.
+  const short = String(value)
+    .split(",")
+    .every((part) => ITEM_RANGE_PART.test(part.trim()));
   const valid =
-    parts?.every(({ start, last }) => start >= 1 && last <= source.count) ?? false;
+    short && (parts?.every(({ start, last }) => start >= 1 && last <= source.count) ?? false);
   return valid
     ? { count: countRange(value), error: null }
     : {
         count: null,
-        error: `${source.title}: use item numbers from 1 to ${source.count}, such as 1-${source.count} or 2,3.`,
+        error: `${source.title}: use item numbers from 1 to ${source.count}, such as 1-${source.count} or 2,3, or 0 for all of them in each task.`,
       };
 }
 
@@ -756,6 +763,9 @@ function selectedItems(expression: string) {
 export function itemsPreview(source: TaskList, value: string): string {
   if (!source.values?.length || fieldCount(source, value).error) {
     return "";
+  }
+  if (String(value).trim() === "0") {
+    return "All of them, in each task";
   }
   const numbers = selectedItems(value);
   const shown = numbers
@@ -1517,7 +1527,7 @@ function renderTasks() {
     h(
       "p",
       { className: "dl-help" },
-      "Each field below runs its items as separate tasks, and fields multiply. Narrow a field to the items to run by number, such as 1-2 or 2,3."
+      "Each field below runs its items as separate tasks, and fields multiply. Narrow a field to the items to run by number, such as 1-2 or 2,3, or set it to 0 to run that list whole in each task."
     ),
     sources.map(taskListField)
   );

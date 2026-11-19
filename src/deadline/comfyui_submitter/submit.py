@@ -640,8 +640,8 @@ def _item_parameters(source: ItemSource) -> dict[str, Any]:
             break
     description = (
         f"The items of {source.label} to run as separate tasks, numbered from 1, for example "
-        f'"1-{source.count}" or "2,3". "0" on its own runs them all in one task, like the '
-        "panel's One task. Every combination of the lists is a task."
+        f'"1-{source.count}" or "2,3". "0" on its own runs the whole list in each task. Every '
+        "combination of the lists is a task."
     )
     if shown:
         description += " Items: " + "; ".join(shown) + "."

@@ -1008,3 +1008,19 @@ def test_list_job_parameters_steer_clear_of_the_templates_names(tmp_path):
     studio = _studio_template(tmp_path, job_parameter="SubjectItems")
     template = submit.read_job_template(studio, plan.active)
     decode_job_template(template=template, supported_extensions=["EXPR"])
+
+
+ITEM_RANGES = json.loads(
+    (Path(__file__).parent / "panel" / "item_ranges.json").read_text(encoding="utf-8")
+)
+
+
+@pytest.mark.parametrize("case", ITEM_RANGES, ids=lambda case: repr(case["value"]))
+def test_check_item_range_takes_the_same_ranges_as_the_panel(case):
+    """item_ranges.json is shared with test_panel.py, so the submitter and the panel agree."""
+    source = submit.ItemSource("List5", "Create List #5", case["items"])
+    if case["count"] is None:
+        with pytest.raises(SubmitError):
+            submit.check_item_range(source, case["value"])
+    else:
+        submit.check_item_range(source, case["value"])

@@ -267,8 +267,7 @@ if (scenario === "edited-before-replanning") {
   result.openjdCounts = ["1-3,2", "2,2", "1-5:2,2", "1,,2", "1,", "3,1", "1-5:2,6"].map(ui.countRange);
   result.tasks = ui.taskCount(sources, (item) => item.range);
   result.previews = ["2-5", "0", "x", "3,1"].map((value) => ui.itemsPreview(sources[1], value));
-  // A field holds item numbers from 1 to the list's count. 0 isn't one: turning off Split into
-  // tasks runs the lists whole.
+  // A field holds item numbers from 1 to the list's count, or 0 to run that list whole in each task.
   result.listCounts = ["1-3", "2,3", "0", "2-5", "-1", "0,1", "1-3:2", "1-4:3"].map((value) =>
     ui.taskCount([sources[0]], () => value)
   );
@@ -330,6 +329,16 @@ if (scenario === "parse-bool") {
   // The panel reads a BOOL parameter as OpenJD and the submitter do.
   result.values = [true, "true", "Yes", " ON ", "1", 1, false, "FALSE", "no", "off", "0", 0, "", "garbage", 2].map(
     ui.parseBool
+  );
+}
+if (scenario === "item-range-contract") {
+  // The cases that test_submit.py also checks against the submitter's check_item_range.
+  const { readFileSync } = await import("node:fs");
+  const cases = JSON.parse(readFileSync(new URL("./item_ranges.json", import.meta.url), "utf8"));
+  ui.setSplit(true);
+  const list = { name: "List5", parameter: "List5Items", label: "List5", title: "List5", kind: "list" };
+  result.counts = cases.map(({ value, items }) =>
+    ui.taskCount([{ ...list, values: [], count: items, range: `1-${items}` }], () => value)
   );
 }
 console.log(JSON.stringify(result));

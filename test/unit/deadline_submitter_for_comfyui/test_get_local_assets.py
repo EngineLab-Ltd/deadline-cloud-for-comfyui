@@ -533,3 +533,27 @@ def test_models_with_the_same_name_in_different_folders_are_each_attached(tmp_pa
         "checkpoints/shared.safetensors": dest / "checkpoints" / "shared.safetensors",
         "loras/shared.safetensors": dest / "loras" / "shared.safetensors",
     }
+
+
+def test_stage_local_node_packs_leaves_out_files_that_can_hold_credentials(comfy, tmp_path, caplog):
+    """An API-backed pack can keep its keys in its folder, and anyone who can use the queue can
+    read job attachments."""
+    pack = comfy["custom_nodes"] / "api-nodes"
+    for kept in ("__init__.py", "config.json", "keys/README.md", ".env.py/__init__.py"):
+        touch(pack / kept)
+    for secret in (
+        ".env",
+        ".env.local",
+        "certs/client.pem",
+        "api.KEY",
+        "credentials",
+        "secrets.json",
+    ):
+        touch(pack / secret)
+    dest = tmp_path / "local_nodes"
+    stage_local_node_packs({"api-nodes": pack}, dest)
+    files = sorted(
+        p.relative_to(dest / "api-nodes").as_posix() for p in dest.rglob("*") if p.is_file()
+    )
+    assert files == [".env.py/__init__.py", "__init__.py", "config.json", "keys/README.md"]
+    assert "can hold credentials" in caplog.text

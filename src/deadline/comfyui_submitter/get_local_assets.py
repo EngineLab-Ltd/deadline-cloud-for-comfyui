@@ -9,6 +9,7 @@ directory in the same way.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 import os
@@ -219,14 +220,43 @@ _SKIPPED_NODE_DIRS = frozenset(
 )
 
 
+# Left out of staged node packs: files that usually hold credentials, such as an API-backed
+# pack's keys. Job attachments can be read by anyone who can use the queue. Settings files such
+# as config.json are kept, since packs need them to run.
+_SECRET_NODE_FILES = (
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "id_rsa",
+    "id_ecdsa",
+    "id_ed25519",
+    ".netrc",
+    "credentials",
+    "credentials.*",
+    "secrets.json",
+    "secrets.toml",
+    "secrets.yaml",
+    "secrets.yml",
+)
+
+
+def _is_secret_node_file(name: str) -> bool:
+    return any(fnmatch.fnmatch(name.lower(), pattern) for pattern in _SECRET_NODE_FILES)
+
+
 def _ignore_node_files(directory: str, names: list[str]) -> set[str]:
-    return {
-        name
-        for name in names
-        if name in _SKIPPED_NODE_DIRS
-        or name.endswith(".pyc")
-        or (Path(directory, name) / "pyvenv.cfg").is_file()
-    }
+    ignored = set()
+    for name in names:
+        path = Path(directory, name)
+        if name in _SKIPPED_NODE_DIRS or name.endswith(".pyc") or (path / "pyvenv.cfg").is_file():
+            ignored.add(name)
+        elif _is_secret_node_file(name) and not path.is_dir():
+            logger.warning("Leaving %s out of the job: it can hold credentials", path)
+            ignored.add(name)
+    return ignored
 
 
 def _link_or_copy(source: str, target: str) -> str:

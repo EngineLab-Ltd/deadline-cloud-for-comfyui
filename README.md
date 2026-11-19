@@ -247,6 +247,10 @@ the same machine.
   your files and keep their permissions, but they can only be reached through the bundle, which
   is deleted once its job is created. On Windows, bundles inherit the permissions of the ComfyUI
   user folder. The `deadline_cloud_submitter.json` config file is also `0600`.
+- Custom node packs are uploaded with their files to the queue's job attachments bucket, where
+  anyone who can use the queue can read them. Credential files, such as `.env`, `*.key` and `*.pem`,
+  are left out. A pack's settings files, such as `config.json`, are attached as they are, so keep
+  API keys in environment variables on the workers instead.
 
 **Sharing a server.** `COMFYUI_DEADLINE_ALLOW_REMOTE=1` turns off the local-only check, including
 for requests through a proxy. Only set it when every person who can reach ComfyUI may submit with

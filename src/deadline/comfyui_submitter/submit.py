@@ -286,6 +286,16 @@ def validate_api_workflow(workflow: Any, ui_workflow: Any = None) -> dict[str, A
             raise SubmitError(f"Node {_quoted(node_id)} has no node type in the workflow.")
         if not isinstance(node.get("inputs", {}), dict):
             raise SubmitError(f"Node {_quoted(node_id)} has inputs that aren't an object.")
+        if node.get("_meta") is not None and not isinstance(node["_meta"], dict):
+            raise SubmitError(f"Node {_quoted(node_id)} has a _meta that isn't an object.")
+        if node["class_type"] == "CreateList":
+            for key in node.get("inputs", {}):
+                match = _ANY_LIST_ITEM_INPUT.fullmatch(str(key))
+                if match and not _LIST_ITEM_INPUT.fullmatch(str(key)):
+                    raise SubmitError(
+                        f"Create List {_quoted(node_id)} has an input numbered past "
+                        f"{_MAX_LIST_ITEM_DIGITS} digits, which ComfyUI doesn't make."
+                    )
     return workflow
 
 
@@ -317,7 +327,11 @@ ITEMS_PLACEHOLDER = "ITEMS = {}"
 # The group of the job parameters that hold each list's items to run.
 TASKS_GROUP = "Tasks"
 
-_LIST_ITEM_INPUT = re.compile(r"(inputs\.)?input\d+")
+# A Create List's item inputs: input0, input1 and so on, or inputs.input0 inside a subgraph. The
+# number is bounded so it's always safe to read, in the submitter and the task script.
+_MAX_LIST_ITEM_DIGITS = 9
+_LIST_ITEM_INPUT = re.compile(rf"(inputs\.)?input\d{{1,{_MAX_LIST_ITEM_DIGITS}}}", re.ASCII)
+_ANY_LIST_ITEM_INPUT = re.compile(r"(inputs\.)?input\d+", re.ASCII)
 # The titles ComfyUI gives the nodes that list tasks. Any other title is one the artist gave.
 _DEFAULT_TITLES = {
     "CreateList": "Create List",

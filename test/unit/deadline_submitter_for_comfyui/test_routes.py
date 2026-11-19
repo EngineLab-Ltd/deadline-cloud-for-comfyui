@@ -446,6 +446,50 @@ def test_malformed_workflows_get_a_400(comfy, monkeypatch, path, node, error):
     assert body["error"].startswith(error)
 
 
+def _list_into(meta: object) -> dict:
+    """A Create List feeding a later node whose _meta is as given."""
+    return {
+        "1": {"class_type": "CreateList", "inputs": {"input0": "a", "input1": "b"}},
+        "2": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}, "_meta": meta},
+    }
+
+
+@pytest.mark.parametrize(
+    ("workflow", "error"),
+    [
+        (_list_into("Save Image"), "Node 2 has a _meta that isn't an object."),
+        (_list_into(["Save Image"]), "Node 2 has a _meta that isn't an object."),
+        (
+            {
+                "1": {
+                    "class_type": "CreateList",
+                    "inputs": {"input0": "a", "input" + "9" * 5000: "b"},
+                }
+            },
+            "Create List 1 has an input numbered past 9 digits, which ComfyUI doesn't make.",
+        ),
+    ],
+)
+@pytest.mark.parametrize("split", [True, False])
+@pytest.mark.parametrize("path", ["/deadline/plan", "/deadline/bundle", "/deadline/jobs"])
+def test_malformed_lists_get_a_400_before_planning(
+    comfy, monkeypatch, path, split, workflow, error
+):
+    """Planning reads every node's _meta and each Create List input's number."""
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    body = {**JOB, "workflow": workflow, "splitTasks": split}
+    status, response = run(call(comfy, path, body))
+    assert (status, response["error"]) == (400, error)
+    assert not requests.exists()
+
+
+def test_lists_with_a_null_meta_still_plan(comfy, monkeypatch):
+    fake_tools(monkeypatch, comfy.tmp_path)
+    status, body = run(call(comfy, "/deadline/plan", {"workflow": _list_into(None), "name": "x"}))
+    assert status == 200, body
+    assert [source["name"] for source in body["sources"]] == ["List1"]
+
+
 def test_cloud_runs_the_bridge_with_the_cli_python(comfy, monkeypatch):
     fake_cli(monkeypatch, comfy.tmp_path, "")
     farms = {"farms": [{"farmId": "farm-1", "displayName": "Render"}]}

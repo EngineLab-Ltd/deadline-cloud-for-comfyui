@@ -436,7 +436,7 @@ steps:
             elif class_type == "CreateList" and name:
                 # The node takes its items from inputs named input0, input1 and so on, in order.
                 items = sorted(
-                    (key for key in inputs if re.fullmatch(r"(inputs\.)?input\d+", key)),
+                    (key for key in inputs if re.fullmatch(r"(inputs\.)?input\d{1,9}", key)),
                     key=lambda key: int(re.search(r"\d+$", key).group()),
                 )
                 index = item(name, len(items), "A Create List")

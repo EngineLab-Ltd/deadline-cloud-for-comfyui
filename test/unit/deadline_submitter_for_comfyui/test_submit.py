@@ -970,3 +970,41 @@ def test_list_names_fit_openjd_for_very_long_node_ids():
     names = [source.parameter for source in plan_task_lists(workflow).sources]
     assert len(set(names)) == 2
     assert all(len(name) <= 64 for name in names)
+
+
+def _studio_template(
+    tmp_path: Path, task_parameters: bool = False, job_parameter: str = ""
+) -> Path:
+    """The bundled template, with a step that has its own task parameter or an extra job one."""
+    template = yaml.safe_load(submit.JOB_TEMPLATE.read_text())
+    if task_parameters:
+        template["steps"][0]["parameterSpace"] = {
+            "taskParameterDefinitions": [{"name": "Frame", "type": "INT", "range": "1-3"}],
+            "combination": "Frame",
+        }
+    if job_parameter:
+        template["parameterDefinitions"].append(
+            {"name": job_parameter, "type": "STRING", "default": "x"}
+        )
+    path = tmp_path / "studio.yaml"
+    path.write_text(yaml.safe_dump(template, sort_keys=False))
+    return path
+
+
+def test_templates_whose_step_has_task_parameters_dont_split_lists(tmp_path):
+    """Their names, the 16-parameter limit and their combination would all have to fit around."""
+    studio = _studio_template(tmp_path, task_parameters=True)
+    assert not template_supports_task_lists(studio)
+    assert submit.template_has_own_task_parameters(studio)
+    assert not submit.template_has_own_task_parameters(submit.JOB_TEMPLATE)
+
+
+def test_list_job_parameters_steer_clear_of_the_templates_names(tmp_path):
+    """A studio template's own SubjectItems job parameter isn't repeated by a list called Subject."""
+    workflow = {"1": {**_create_list("a", "b"), "_meta": {"title": "Subject"}}}
+    plan = plan_task_lists(workflow, reserved={"SubjectItems", "WorkflowFile"})
+    [source] = plan.active
+    assert (source.name, source.parameter) == ("Subject_1", "Subject_1Items")
+    studio = _studio_template(tmp_path, job_parameter="SubjectItems")
+    template = submit.read_job_template(studio, plan.active)
+    decode_job_template(template=template, supported_extensions=["EXPR"])

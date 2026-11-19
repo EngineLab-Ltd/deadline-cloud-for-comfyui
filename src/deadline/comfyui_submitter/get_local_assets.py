@@ -10,6 +10,7 @@ directory in the same way.
 from __future__ import annotations
 
 import fnmatch
+import functools
 import json
 import logging
 import os
@@ -259,11 +260,14 @@ def _ignore_node_files(directory: str, names: list[str]) -> set[str]:
     return ignored
 
 
-def _link_or_copy(source: str, target: str) -> str:
+def _link_or_copy(source: str, target: str, copied: list[str] | None = None) -> str:
+    """Hard links source to target, or copies it, such as from another drive, into copied."""
     try:
         os.link(source, target)
     except OSError:
         shutil.copy2(source, target)
+        if copied is not None:
+            copied.append(source)
     return target
 
 
@@ -280,20 +284,21 @@ def stage_local_node_packs(packs: Mapping[str, Path], dest: Path) -> dict[str, P
             logger.warning("Not staging custom node pack %r from %s", name, source)
             continue
         target = dest / name
+        copied: list[str] = []
         try:
             if source.is_dir():
                 shutil.copytree(
                     source,
                     target,
                     ignore=_ignore_node_files,
-                    copy_function=_link_or_copy,
+                    copy_function=functools.partial(_link_or_copy, copied=copied),
                     ignore_dangling_symlinks=True,
                     dirs_exist_ok=True,
                 )
             elif source.is_file() and source.suffix == ".py":
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if not target.exists():
-                    _link_or_copy(str(source), str(target))
+                    _link_or_copy(str(source), str(target), copied)
             else:
                 logger.warning("Not staging custom node pack %r from %s", name, source)
                 continue
@@ -304,6 +309,15 @@ def stage_local_node_packs(packs: Mapping[str, Path], dest: Path) -> dict[str, P
             else:
                 target.unlink(missing_ok=True)
             continue
+        if copied:
+            # Copying takes time and space. The copies are deleted with the bundle.
+            logger.warning(
+                "Copied %d files of custom node pack %r into the job bundle, since they can't be "
+                "linked from %s",
+                len(copied),
+                name,
+                source,
+            )
         staged[name] = target
     return dict(sorted(staged.items()))
 

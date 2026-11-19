@@ -557,3 +557,23 @@ def test_stage_local_node_packs_leaves_out_files_that_can_hold_credentials(comfy
     )
     assert files == [".env.py/__init__.py", "__init__.py", "config.json", "keys/README.md"]
     assert "can hold credentials" in caplog.text
+
+
+def test_stage_local_node_packs_warns_when_it_copies_a_file(comfy, tmp_path, monkeypatch, caplog):
+    """A copy, such as of a pack on another drive, takes time and space, so it's logged."""
+    pack = comfy["custom_nodes"] / "studio-nodes"
+    touch(pack / "__init__.py")
+    touch(pack / "nodes.py")
+
+    def fail_link(source, target):
+        raise OSError("Invalid cross-device link")
+
+    monkeypatch.setattr("deadline.comfyui_submitter.get_local_assets.os.link", fail_link)
+    dest = tmp_path / "local_nodes"
+    assert stage_local_node_packs({"studio-nodes": pack}, dest) == {
+        "studio-nodes": dest / "studio-nodes"
+    }
+    assert (dest / "studio-nodes" / "__init__.py").is_file()
+    # Once for the pack, not for each file.
+    [record] = [r for r in caplog.records if "Copied" in r.getMessage()]
+    assert "Copied 2 files of custom node pack 'studio-nodes'" in record.getMessage()

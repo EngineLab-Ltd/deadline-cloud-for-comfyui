@@ -259,8 +259,9 @@ def _is_secret_node_file(name: str) -> bool:
 def _ignore_node_files(root: Path, directory: str, names: list[str]) -> set[str]:
     """
     The entries of a pack's folder to leave out of the job. root is the pack's folder, resolved.
-    copytree follows symbolic links, so a link is attached only when it points inside the pack, and
-    is checked for credentials by its target's name as well as its own.
+    copytree follows links, so an entry is attached only when it resolves inside the pack, and is
+    checked for credentials by its target's name as well as its own. Every entry is resolved, not
+    only symbolic links, since Python doesn't count a Windows directory junction as one.
     """
     ignored = set()
     for name in names:
@@ -268,15 +269,11 @@ def _ignore_node_files(root: Path, directory: str, names: list[str]) -> set[str]
         if name in _SKIPPED_NODE_DIRS or name.endswith(".pyc") or (path / "pyvenv.cfg").is_file():
             ignored.add(name)
             continue
-        target = path.resolve() if path.is_symlink() else path
-        if path.is_symlink() and not target.is_relative_to(root):
+        target = path.resolve()
+        if not target.is_relative_to(root):
             logger.warning("Leaving %s out of the job: it links outside the pack", path)
             ignored.add(name)
-        elif (
-            path.is_symlink()
-            and target.is_dir()
-            and Path(directory).resolve().is_relative_to(target)
-        ):
+        elif target.is_dir() and Path(directory).resolve().is_relative_to(target):
             logger.warning("Leaving %s out of the job: it links to a folder that holds it", path)
             ignored.add(name)
         elif not (path.is_file() or path.is_dir()):
@@ -290,7 +287,12 @@ def _ignore_node_files(root: Path, directory: str, names: list[str]) -> set[str]
 
 
 def _link_or_copy(source: str, target: str, copied: list[str] | None = None) -> str:
-    """Hard links source to target, or copies it, such as from another drive, into copied."""
+    """
+    Hard links source to target, or copies it, such as from another drive, into copied. A link is
+    resolved first, so the target holds the file itself on every platform: Windows would otherwise
+    hard link the link.
+    """
+    source = os.path.realpath(source)
     try:
         os.link(source, target)
     except OSError:

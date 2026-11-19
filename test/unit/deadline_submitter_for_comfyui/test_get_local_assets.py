@@ -624,6 +624,43 @@ def test_stage_local_node_packs_leaves_out_special_files(comfy, tmp_path, caplog
     assert "events out of the job: it isn't a file or a folder" in caplog.text
 
 
+def test_stage_local_node_packs_links_the_file_a_link_points_to(comfy, tmp_path, monkeypatch):
+    """Windows would hard link the link itself, so the bundle would hold a link, not the file."""
+    pack = comfy["custom_nodes"] / "linked-nodes"
+    nodes = touch(pack / "nodes.py")
+    _symlink(pack / "nodes_link.py", nodes)
+    linked = []
+    real_link = os.link
+
+    def link(source, target):
+        linked.append((Path(source), Path(target).name))
+        real_link(source, target)
+
+    monkeypatch.setattr("deadline.comfyui_submitter.get_local_assets.os.link", link)
+    stage_local_node_packs({"linked-nodes": pack}, tmp_path / "local_nodes")
+    assert sorted(linked, key=lambda item: item[1]) == [
+        (nodes.resolve(), "nodes.py"),
+        (nodes.resolve(), "nodes_link.py"),
+    ]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Directory junctions are Windows only.")
+def test_stage_local_node_packs_leaves_out_junctions_outside_the_pack(comfy, tmp_path, caplog):
+    """Python doesn't count a directory junction as a symbolic link, so it's resolved as well."""
+    pack = comfy["custom_nodes"] / "junction-nodes"
+    touch(pack / "__init__.py")
+    shared = tmp_path / "shared" / "models"
+    touch(shared / "big.safetensors")
+    if sys.platform == "win32":
+        import _winapi
+
+        _winapi.CreateJunction(str(shared), str(pack / "models"))
+    dest = tmp_path / "local_nodes"
+    stage_local_node_packs({"junction-nodes": pack}, dest)
+    assert _staged_files(dest, "junction-nodes") == ["__init__.py"]
+    assert "models out of the job: it links outside the pack" in caplog.text
+
+
 def test_stage_local_node_packs_follows_a_pack_that_is_a_link(comfy, tmp_path):
     """A pack installed as a link to a checkout elsewhere is attached from the checkout."""
     checkout = tmp_path / "dev" / "studio-nodes"

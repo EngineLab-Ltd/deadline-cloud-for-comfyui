@@ -236,11 +236,7 @@ _SECRET_NODE_FILES = (
     "id_ed25519",
     ".netrc",
     "credentials",
-    "credentials.json",
-    "credentials.toml",
-    "credentials.yaml",
-    "credentials.yml",
-    "credentials.ini",
+    "credentials.*",
     "secrets.json",
     "secrets.toml",
     "secrets.yaml",
@@ -248,10 +244,14 @@ _SECRET_NODE_FILES = (
 )
 
 
+_NODE_CODE_SUFFIXES = (".py", ".pyi", ".js", ".mjs")
+
+
 def _is_secret_node_file(name: str) -> bool:
     name = name.lower()
-    # A Python file is the pack's own code, such as a credentials.py that its nodes import.
-    if name.endswith(".py"):
+    # A code file is the pack's own, such as a credentials.py that its nodes import, or its web
+    # extension's JavaScript.
+    if name.endswith(_NODE_CODE_SUFFIXES):
         return False
     return any(fnmatch.fnmatch(name, pattern) for pattern in _SECRET_NODE_FILES)
 

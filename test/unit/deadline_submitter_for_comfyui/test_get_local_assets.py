@@ -548,6 +548,7 @@ def test_stage_local_node_packs_leaves_out_files_that_can_hold_credentials(comfy
         "credentials.py",
         "auth/Credentials.py",
         "auth/.env.py",
+        "web/credentials.js",
     )
     for kept in kept_files:
         touch(pack / kept)
@@ -558,6 +559,8 @@ def test_stage_local_node_packs_leaves_out_files_that_can_hold_credentials(comfy
         "api.KEY",
         "credentials",
         "credentials.json",
+        "credentials.cfg",
+        "auth/Credentials.TXT",
         "secrets.json",
     ):
         touch(pack / secret)

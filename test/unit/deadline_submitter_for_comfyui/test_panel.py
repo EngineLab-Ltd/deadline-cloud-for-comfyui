@@ -48,6 +48,7 @@ def _run_scenario(tmp_path: Path, ui_source: str, scenario: str) -> dict:
     for name in ("app.js", "api.js"):
         shutil.copy(PANEL / name, tmp_path / "scripts" / name)
     shutil.copy(PANEL / "harness.mjs", tmp_path / "harness.mjs")
+    shutil.copy(PANEL / "item_ranges.json", tmp_path / "item_ranges.json")
     web = tmp_path / "extension" / "web"
     web.mkdir(parents=True)
     # The harness reads the panel's state, and what a queue field shows, through these exports,
@@ -298,9 +299,14 @@ def test_task_lists_count_tasks_and_send_their_ranges(run_scenario):
     # Every combination: 3 list items × 5 images.
     assert result["tasks"] == 15
     # Previews follow the order the tasks run in.
-    assert result["previews"] == ["b.png, c.png, d.png, …", "", "", "a.png, c.png"]
-    # A 3-item list: numbers past the end, below 1, or 0, can't be submitted.
-    assert result["listCounts"] == [3, 2, None, None, None, None, 2, None]
+    assert result["previews"] == [
+        "b.png, c.png, d.png, …",
+        "All of them, in each task",
+        "",
+        "a.png, c.png",
+    ]
+    # A 3-item list: numbers past the end or below 1 can't be submitted. 0 runs it whole.
+    assert result["listCounts"] == [3, 2, 1, None, None, None, 2, None]
     assert result["openjdCounts"] == [None, None, None, None, None, 2, 4]
     assert result["splitByDefault"] is False
     assert result["splitRequest"] is True
@@ -317,3 +323,9 @@ def test_task_lists_count_tasks_and_send_their_ranges(run_scenario):
     assert result["canSubmitBadRange"] is False
     assert result["canSubmit"] is True
     assert result["parameters"] == {"List1Items": "1-3", "Folder2Items": "1-2"}
+
+
+def test_list_fields_take_the_same_ranges_as_the_submitter(run_scenario):
+    """item_ranges.json is shared with test_submit.py, so the panel and the submitter agree."""
+    cases = json.loads((PANEL / "item_ranges.json").read_text())
+    assert run_scenario("item-range-contract")["counts"] == [case["count"] for case in cases]

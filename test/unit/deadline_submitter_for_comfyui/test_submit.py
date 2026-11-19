@@ -371,7 +371,7 @@ def test_host_requirements_openjd_accepts(requirements, tmp_path):
     )
     template = yaml.safe_load((bundle_dir / "template.yaml").read_text())
     assert template["steps"][0]["hostRequirements"] == requirements
-    decode_job_template(template=template)
+    decode_job_template(template=template, supported_extensions=["EXPR"])
 
 
 @pytest.mark.parametrize(
@@ -413,7 +413,7 @@ def test_create_job_bundle_can_remove_host_requirements(tmp_path):
     bundle_dir, _ = create_job_bundle(submit.JOB_TEMPLATE, {}, "w", tmp_path, requirements={})
     template = yaml.safe_load((bundle_dir / "template.yaml").read_text())
     assert "hostRequirements" not in template["steps"][0]
-    decode_job_template(template=template)
+    decode_job_template(template=template, supported_extensions=["EXPR"])
 
 
 @pytest.mark.parametrize(

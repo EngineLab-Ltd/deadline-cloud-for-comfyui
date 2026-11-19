@@ -54,6 +54,24 @@ interface PathLists {
   directories: string[];
 }
 
+interface AttributeRequirement {
+  name: string;
+  anyOf?: string[];
+  allOf?: string[];
+}
+
+interface AmountRequirement {
+  name: string;
+  min?: number;
+  max?: number;
+}
+
+interface HostRequirements {
+  attributes?: AttributeRequirement[];
+  amounts?: AmountRequirement[];
+}
+
+// What /deadline/plan returns for the workflow.
 interface Plan {
   name: string;
   template: string;
@@ -61,6 +79,7 @@ interface Plan {
   values?: Record<string, ParameterValue>;
   queueValues?: Record<string, string>;
   attachments?: PathLists;
+  hostRequirements?: HostRequirements;
   // id is the model's folder and name, such as checkpoints/sd.safetensors. Two models can share a
   // name in different folders.
   localModels?: { id: string; name: string; directory: string | null; path: string }[];
@@ -77,6 +96,26 @@ interface Submission {
   confirm?: { message: string; default?: boolean } | null;
 }
 
+interface Job {
+  jobId: string;
+  name: string;
+  farmId: string;
+  queueId: string;
+  submittedAt: string;
+  // Where Download puts the outputs, on the ComfyUI machine. Jobs saved by older panels have none.
+  outputDir?: string;
+}
+
+interface JobStatus {
+  jobId: string;
+  taskRunStatus?: string;
+  lifecycleStatus?: string;
+  taskRunStatusCounts?: Record<string, number>;
+  error?: string;
+  // The job doesn't exist, or these credentials can't see it, so it isn't polled again.
+  notFound?: boolean;
+}
+
 // The deadline.* events the routes send over ComfyUI's websocket.
 interface SubmissionEvent {
   submissionId: string;
@@ -90,7 +129,32 @@ interface SubmissionEvent {
   jobId?: string;
   farmId?: string;
   queueId?: string;
+  outputDir?: string;
   error?: string;
+}
+
+interface DownloadEvent {
+  jobId: string;
+  status: "DOWNLOADING" | "DOWNLOADED" | "FAILED";
+  progress?: string;
+  message?: string;
+  fileCount?: number;
+  // The folder the CLI downloaded the files into.
+  directory?: string;
+  error?: string;
+}
+
+// The host requirements form. Its numbers are kept as the text in the fields.
+interface RangeFields {
+  min?: string;
+  max?: string;
+}
+
+interface HostForm {
+  choices: Record<string, string[]>;
+  hardware: Record<string, RangeFields>;
+  amounts: (RangeFields & { name: string })[];
+  attributes: { name: string; mode: "anyOf" | "allOf"; values: string }[];
 }
 
 type Settings = Record<string, string | number | boolean>;
@@ -99,6 +163,9 @@ export const SUMMARY = "Deadline Cloud";
 export const SIDEBAR_TAB_ID = "deadline-cloud";
 
 const SETTINGS_KEY = "DeadlineCloud.Submitter.JobSettings";
+const JOBS_KEY = "DeadlineCloud.Submitter.RecentJobs";
+const MAX_RECENT_JOBS = 20;
+const JOB_POLL_MS = 20000;
 const PLAN_DEBOUNCE_MS = 1000;
 const TOOLTIP_DELAY_MS = 200;
 const TOOLTIP_GAP = 6;
@@ -114,6 +181,7 @@ const DEFAULT_SETTINGS: Settings = {
   maxWorkerCount: "",
   jobAttachmentsFileSystem: "",
 };
+const DONE_STATUSES = new Set(["SUCCEEDED", "FAILED", "CANCELED"]);
 // The most attachments the panel lists. All of them are still attached.
 const MAX_LISTED_ATTACHMENTS = 100;
 
@@ -163,10 +231,14 @@ interface State {
   queueEdits: Record<string, ParameterValue>;
   jobName: string | null;
   jobDescription: string;
+  // The host requirements form, once the artist edits it. Until then the job template's apply.
+  hostForm: HostForm | null;
   settings: Settings;
   removedAttachments: Set<string>;
   addedAttachments: PathLists;
   submission: Submission | null;
+  jobs: Job[];
+  jobStatus: Record<string, JobStatus>;
 }
 
 const state: State = {
@@ -188,10 +260,13 @@ const state: State = {
   queueEdits: {},
   jobName: null,
   jobDescription: "",
+  hostForm: null,
   settings: { ...DEFAULT_SETTINGS, ...readStorage<Settings>(SETTINGS_KEY, {}) },
   removedAttachments: new Set(),
   addedAttachments: { filenames: [], directories: [] },
   submission: null,
+  jobs: readStorage<Job[]>(JOBS_KEY, []),
+  jobStatus: {},
 };
 
 type SectionName =
@@ -201,8 +276,10 @@ type SectionName =
   | "jobSettings"
   | "parameters"
   | "queueParameters"
+  | "hostRequirements"
   | "attachments"
-  | "submit";
+  | "submit"
+  | "jobs";
 
 interface View {
   render(names?: SectionName[] | null): void;
@@ -210,6 +287,7 @@ interface View {
 
 const views = new Set<View>();
 
+// Re-renders the named sections of every open view, or all of them.
 function refresh(...sections: SectionName[]) {
   for (const view of views) {
     view.render(sections.length ? sections : null);
@@ -305,6 +383,8 @@ export function loadAccount(force = false) {
     }
     refresh();
     if (state.account?.authenticationStatus === "AUTHENTICATED") {
+      // Recent jobs waits for the account, so poll now rather than at the next timer.
+      pollJobs();
       await loadFarms();
     }
   })();
@@ -550,10 +630,12 @@ export function canSubmit(): boolean {
     state.plan !== null &&
     !state.planning &&
     !state.planError &&
-    !state.submission
+    !state.submission &&
+    !hostFormError()
   );
 }
 
+// What the job bundle is made from, whether it's submitted or saved.
 function bundleRequest() {
   const plan = state.plan;
   const parameters: Record<string, ParameterValue> = {};
@@ -588,6 +670,7 @@ function bundleRequest() {
     parameters,
     settings,
     description: state.jobDescription.trim(),
+    hostRequirements: state.hostForm ? requirementsFromForm(state.hostForm) : undefined,
     attachments: attachments(),
     excludedModels: excludedModels(),
   };
@@ -694,6 +777,14 @@ async function cancelSubmission() {
   }
 }
 
+function rememberJob(job: Job) {
+  state.jobs = [job, ...state.jobs.filter((other) => other.jobId !== job.jobId)].slice(
+    0,
+    MAX_RECENT_JOBS
+  );
+  writeStorage(JOBS_KEY, state.jobs);
+}
+
 export function listenForSubmissions() {
   api.addEventListener<SubmissionEvent>("deadline.progress", ({ detail }) => {
     const submission = state.submission;
@@ -724,6 +815,17 @@ export function listenForSubmissions() {
     const ours = detail.submissionId === state.submission?.id;
     if (detail.status === "SUBMITTED") {
       toast("success", `Submitted ${detail.name} as ${detail.jobId}.`, 10000);
+      if (detail.jobId && detail.farmId && detail.queueId) {
+        rememberJob({
+          jobId: detail.jobId,
+          name: detail.name ?? detail.jobId,
+          farmId: detail.farmId,
+          queueId: detail.queueId,
+          submittedAt: new Date().toISOString(),
+          outputDir: detail.outputDir,
+        });
+        pollJobs();
+      }
     } else if (detail.status === "FAILED") {
       toast("error", `Couldn't submit ${detail.name}. ${detail.error ?? ""}`, 15000);
     } else if (detail.status === "CANCELED" && ours) {
@@ -731,10 +833,77 @@ export function listenForSubmissions() {
     }
     if (ours) {
       state.submission = null;
-      refresh("submit", "status");
+      refresh("submit", "status", "jobs");
     }
   });
   api.addEventListener("graphChanged", schedulePlan);
+  listenForDownloads();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Job status
+
+let pollTimer: ReturnType<typeof setTimeout> | undefined;
+// One poll runs at a time. A request during one polls again when it ends, so a new job isn't
+// left waiting for the next timer.
+let polling = false;
+let pollAgain = false;
+
+async function pollJobs() {
+  if (polling) {
+    pollAgain = true;
+    return;
+  }
+  polling = true;
+  try {
+    await pollOnce();
+  } finally {
+    polling = false;
+  }
+  if (pollAgain) {
+    pollAgain = false;
+    await pollJobs();
+  }
+}
+
+async function pollOnce() {
+  clearTimeout(pollTimer);
+  // A deleted job, or one these credentials can't see, isn't asked about again. Other errors,
+  // such as throttling or expired credentials, are tried again next time.
+  const pending = state.jobs.filter((job) => {
+    const status = state.jobStatus[job.jobId];
+    return !status?.notFound && !DONE_STATUSES.has(status?.taskRunStatus ?? "");
+  });
+  const byQueue = new Map<string, Job[]>();
+  for (const job of pending) {
+    const key = `${job.farmId}/${job.queueId}`;
+    byQueue.set(key, [...(byQueue.get(key) ?? []), job]);
+  }
+  if (state.account?.authenticationStatus === "AUTHENTICATED") {
+    for (const jobs of byQueue.values()) {
+      try {
+        const result = await cloud<{ jobs: JobStatus[] }>("jobs", {
+          farmId: jobs[0].farmId,
+          queueId: jobs[0].queueId,
+          jobIds: jobs.map((job) => job.jobId),
+        });
+        for (const job of result.jobs) {
+          // A passing error keeps the last status the job had, and its Download button.
+          const previous = state.jobStatus[job.jobId];
+          if (job.error && !job.notFound && previous && !previous.error) {
+            continue;
+          }
+          state.jobStatus[job.jobId] = job;
+        }
+      } catch {
+        // Try again next time.
+      }
+    }
+    refresh("jobs");
+  }
+  if (views.size && pending.length) {
+    pollTimer = setTimeout(pollJobs, JOB_POLL_MS);
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -780,6 +949,7 @@ function h<K extends keyof HTMLElementTagNameMap>(
   return element;
 }
 
+// The value or checked state of the input, select or textarea an event came from.
 function inputValue(event: Event): string {
   return (event.target as HTMLInputElement).value;
 }
@@ -1135,6 +1305,375 @@ function renderQueueParameters() {
   );
 }
 
+// Each hardware row: capability, label and scale. Memory capabilities are in MiB, and the fields
+// are in GiB.
+const HOST_HARDWARE: [string, string, number][] = [
+  ["amount.worker.vcpu", "vCPUs", 1],
+  ["amount.worker.memory", "Memory (GiB)", 1024],
+  ["amount.worker.gpu", "GPUs", 1],
+  ["amount.worker.gpu.memory", "GPU memory (GiB)", 1024],
+  ["amount.worker.disk.scratch", "Scratch space (GiB)", 1],
+];
+const HOST_CHOICES: [string, string, string[]][] = [
+  ["attr.worker.os.family", "Operating system", ["linux", "macos", "windows"]],
+  ["attr.worker.cpu.arch", "CPU architecture", ["x86_64", "arm64"]],
+];
+
+function formFromRequirements(requirements?: HostRequirements): HostForm {
+  const form: HostForm = { choices: {}, hardware: {}, amounts: [], attributes: [] };
+  for (const attribute of requirements?.attributes ?? []) {
+    // Values that have no checkbox, such as aarch64, keep the attribute as a custom one, so
+    // editing the form doesn't drop them.
+    const options = HOST_CHOICES.find(([name]) => name === attribute.name)?.[2];
+    const known = options && attribute.anyOf?.every((value) => options.includes(value));
+    if (known && attribute.anyOf) {
+      form.choices[attribute.name] = [...attribute.anyOf];
+    } else {
+      const mode = attribute.allOf ? ("allOf" as const) : ("anyOf" as const);
+      form.attributes.push({
+        name: attribute.name.replace(/^attr\./, ""),
+        mode,
+        values: (attribute[mode] ?? []).join(", "),
+      });
+    }
+  }
+  for (const amount of requirements?.amounts ?? []) {
+    const known = HOST_HARDWARE.find(([name]) => name === amount.name);
+    const toField = (value?: number) =>
+      value === undefined ? "" : String(value / (known?.[2] ?? 1));
+    const fields = { min: toField(amount.min), max: toField(amount.max) };
+    if (known) {
+      form.hardware[amount.name] = fields;
+    } else {
+      form.amounts.push({ name: amount.name.replace(/^amount\./, ""), ...fields });
+    }
+  }
+  return form;
+}
+
+function amountRequirement(name: string, fields: RangeFields, scale = 1): AmountRequirement {
+  const requirement: AmountRequirement = { name };
+  for (const key of ["min", "max"] as const) {
+    if (fields[key] !== "" && fields[key] !== undefined) {
+      requirement[key] = Number(fields[key]) * scale;
+    }
+  }
+  return requirement;
+}
+
+function requirementsFromForm(form: HostForm): Required<HostRequirements> {
+  const attributes: AttributeRequirement[] = [];
+  for (const [name] of HOST_CHOICES) {
+    if (form.choices[name]?.length) {
+      attributes.push({ name, anyOf: form.choices[name] });
+    }
+  }
+  for (const attribute of form.attributes) {
+    const values = attribute.values.split(",").map((value) => value.trim()).filter(Boolean);
+    const name = `attr.${attribute.name.trim()}`;
+    attributes.push(attribute.mode === "allOf" ? { name, allOf: values } : { name, anyOf: values });
+  }
+  const amounts: AmountRequirement[] = [];
+  for (const [name, , scale] of HOST_HARDWARE) {
+    const requirement = amountRequirement(name, form.hardware[name] ?? {}, scale);
+    if (Object.keys(requirement).length > 1) {
+      amounts.push(requirement);
+    }
+  }
+  for (const amount of form.amounts) {
+    amounts.push(amountRequirement(`amount.${amount.name.trim()}`, amount));
+  }
+  return { attributes, amounts };
+}
+
+function hostFormError() {
+  if (!state.hostForm) {
+    return null;
+  }
+  const { amounts, attributes } = requirementsFromForm(state.hostForm);
+  for (const amount of amounts) {
+    const label = amount.name.replace(/^amount\.(worker\.)?/, "");
+    if (!amount.name.slice("amount.".length)) {
+      return "Name each custom amount.";
+    }
+    if (amount.min === undefined && amount.max === undefined) {
+      return `Set a min or a max for ${label}.`;
+    }
+    if (amount.min !== undefined && amount.max !== undefined && amount.min > amount.max) {
+      return `The min of ${label} is more than its max.`;
+    }
+  }
+  for (const attribute of attributes) {
+    if (!attribute.name.slice("attr.".length)) {
+      return "Name each custom attribute.";
+    }
+    if (!(attribute.anyOf ?? attribute.allOf ?? []).length) {
+      return `Add a value for ${attribute.name.slice("attr.".length)}.`;
+    }
+  }
+  return null;
+}
+
+function hostForm(): HostForm {
+  return state.hostForm ?? formFromRequirements(state.plan?.hostRequirements);
+}
+
+// The first edit copies the job template's requirements, so they aren't lost by changing one.
+function editHostForm(): HostForm {
+  state.hostForm ??= formFromRequirements(state.plan?.hostRequirements);
+  return state.hostForm;
+}
+
+function hostFormEdited() {
+  for (const element of document.querySelectorAll<HTMLElement>("[data-role='host-error']")) {
+    const error = hostFormError();
+    element.textContent = error ?? "";
+    element.hidden = !error;
+  }
+  for (const element of document.querySelectorAll<HTMLElement>("[data-role='host-reset']")) {
+    element.hidden = !state.hostForm;
+  }
+  refresh("submit");
+}
+
+function hostNumber(placeholder: string, value: string | undefined, onInput: (value: string) => void) {
+  return h("input", {
+    className: "dl-input",
+    type: "number",
+    min: 0,
+    step: "any",
+    placeholder,
+    value: value ?? "",
+    onInput: (event: Event) => {
+      onInput(inputValue(event));
+      hostFormEdited();
+    },
+  });
+}
+
+function renderHostRequirements() {
+  if (!state.plan) {
+    return null;
+  }
+  const form = hostForm();
+  const changed = (rerender = false) => {
+    if (rerender) {
+      refresh("hostRequirements");
+    }
+    hostFormEdited();
+  };
+  const choiceRows = HOST_CHOICES.map(([name, label, options]) =>
+    h(
+      "div",
+      { className: "dl-field" },
+      h(
+        "span",
+        { className: "dl-label", "data-dl-tip": "Workers must have one of the ones you check. Check none to allow any." },
+        label
+      ),
+      h(
+        "div",
+        { className: "dl-row dl-choices" },
+        options.map((option) =>
+          h(
+            "label",
+            { className: "dl-row" },
+            h("input", {
+              type: "checkbox",
+              checked: form.choices[name]?.includes(option) ?? false,
+              onChange: (event: Event) => {
+                const edited = editHostForm();
+                const chosen = new Set(edited.choices[name] ?? []);
+                if (inputChecked(event)) {
+                  chosen.add(option);
+                } else {
+                  chosen.delete(option);
+                }
+                edited.choices[name] = options.filter((item) => chosen.has(item));
+                changed();
+              },
+            }),
+            option
+          )
+        )
+      )
+    )
+  );
+  const hardwareRows = HOST_HARDWARE.map(([name, label]) => {
+    const edit = (key: keyof RangeFields) => (value: string) => {
+      const edited = editHostForm();
+      edited.hardware[name] = { ...edited.hardware[name], [key]: value };
+    };
+    return h(
+      "div",
+      { className: "dl-field" },
+      h(
+        "span",
+        { className: "dl-label", "data-dl-tip": "The least and the most a worker can have to run this job. Leave either empty for no limit." },
+        label
+      ),
+      h(
+        "div",
+        { className: "dl-range" },
+        hostNumber("Min", form.hardware[name]?.min, edit("min")),
+        hostNumber("Max", form.hardware[name]?.max, edit("max"))
+      )
+    );
+  });
+  const remove = (key: "amounts" | "attributes", index: number) =>
+    h(
+      "button",
+      {
+        className: "dl-link",
+        title: "Remove",
+        onClick: () => {
+          editHostForm()[key].splice(index, 1);
+          changed(true);
+        },
+      },
+      "✕"
+    );
+  const customName = (placeholder: string, key: "amounts" | "attributes", index: number) =>
+    h("input", {
+      className: "dl-input",
+      placeholder,
+      value: form[key][index].name,
+      onInput: (event: Event) => {
+        editHostForm()[key][index].name = inputValue(event);
+        hostFormEdited();
+      },
+    });
+  const amountRows = form.amounts.map((amount, index) => {
+    const edit = (field: keyof RangeFields) => (value: string) => {
+      editHostForm().amounts[index][field] = value;
+    };
+    return h(
+      "div",
+      { className: "dl-custom" },
+      h("div", { className: "dl-row" }, customName("Amount name, such as license.nuke", "amounts", index), remove("amounts", index)),
+      h(
+        "div",
+        { className: "dl-range" },
+        hostNumber("Min", amount.min, edit("min")),
+        hostNumber("Max", amount.max, edit("max"))
+      )
+    );
+  });
+  const attributeRows = form.attributes.map((attribute, index) =>
+    h(
+      "div",
+      { className: "dl-custom" },
+      h("div", { className: "dl-row" }, customName("Attribute name, such as software", "attributes", index), remove("attributes", index)),
+      h(
+        "div",
+        { className: "dl-range" },
+        select(
+          [
+            ["anyOf", "Any of"],
+            ["allOf", "All of"],
+          ],
+          attribute.mode,
+          (value: string) => {
+            editHostForm().attributes[index].mode = value === "allOf" ? "allOf" : "anyOf";
+            hostFormEdited();
+          }
+        ),
+        h("input", {
+          className: "dl-input",
+          placeholder: "Values, separated by commas",
+          value: attribute.values,
+          onInput: (event: Event) => {
+            editHostForm().attributes[index].values = inputValue(event);
+            hostFormEdited();
+          },
+        })
+      )
+    )
+  );
+  const error = hostFormError();
+  return section(
+    "Host requirements",
+    false,
+    h(
+      "p",
+      { className: "dl-help" },
+      "Only workers that meet these run the job. If no worker in the queue's fleets does, its tasks wait."
+    ),
+    choiceRows,
+    hardwareRows,
+    amountRows,
+    attributeRows,
+    h(
+      "div",
+      { className: "dl-row" },
+      h(
+        "button",
+        {
+          className: "dl-button dl-small",
+          onClick: () => {
+            editHostForm().amounts.push({ name: "", min: "", max: "" });
+            changed(true);
+          },
+        },
+        "Add amount"
+      ),
+      h(
+        "button",
+        {
+          className: "dl-button dl-small",
+          onClick: () => {
+            editHostForm().attributes.push({ name: "", mode: "anyOf", values: "" });
+            changed(true);
+          },
+        },
+        "Add attribute"
+      ),
+      h(
+        "button",
+        {
+          className: "dl-link",
+          "data-role": "host-reset",
+          "data-dl-tip": "Go back to the job template's host requirements.",
+          hidden: !state.hostForm,
+          onClick: () => {
+            state.hostForm = null;
+            changed(true);
+          },
+        },
+        "Reset to defaults"
+      )
+    ),
+    h(
+      "div",
+      { className: "dl-notice dl-error", "data-role": "host-error", hidden: !error },
+      error ?? ""
+    )
+  );
+}
+
+async function saveBundle() {
+  if (hostFormError() || !state.plan || state.planning) {
+    toast("error", hostFormError() ?? "Wait for the workflow to be read.", 8000);
+    return;
+  }
+  try {
+    const body = await plannedWorkflow();
+    if (!body) {
+      return;
+    }
+    const result = await postJson<{ job_bundle: string; warnings?: string[] }>("/deadline/bundle", {
+      ...body,
+      ...bundleRequest(),
+    });
+    toast("success", `Saved the job bundle to ${result.job_bundle}`, 20000);
+    for (const warning of result.warnings ?? []) {
+      toast("warn", warning, 20000);
+    }
+  } catch (error) {
+    toast("error", `Couldn't save the job bundle: ${messageOf(error)}`, 10000);
+  }
+}
+
 function renderJobSettings() {
   const settings = state.settings;
   const set = (key: string) => (value: ParameterValue) => {
@@ -1216,6 +1755,15 @@ function renderJobSettings() {
         onChange: (event: Event) => set("requirePathsExist")(inputChecked(event)),
       }),
       "Stop the submission if an attached file or folder is missing, instead of submitting without it."
+    ),
+    h(
+      "button",
+      {
+        className: "dl-button dl-small",
+        title: "Create the job bundle without submitting it, to submit later with deadline bundle submit.",
+        onClick: saveBundle,
+      },
+      "Save job bundle"
     )
   );
 }
@@ -1411,6 +1959,141 @@ function renderSubmit() {
   );
 }
 
+function statusText(job: Job): string {
+  const status = state.jobStatus[job.jobId];
+  if (!status) {
+    return "…";
+  }
+  if (status.error) {
+    return "Unknown";
+  }
+  const counts = status.taskRunStatusCounts ?? {};
+  const total = Object.values(counts).reduce((sum, count) => sum + count, 0);
+  const done = counts.SUCCEEDED ?? 0;
+  const failed = counts.FAILED ?? 0;
+  const progress = total ? ` · ${done}/${total}${failed ? `, ${failed} failed` : ""}` : "";
+  const name = status.taskRunStatus ?? status.lifecycleStatus ?? "";
+  return `${name.charAt(0)}${name.slice(1).toLowerCase().replaceAll("_", " ")}${progress}`;
+}
+
+// Downloads by job ID.
+const downloads: Record<string, { status: "DOWNLOADING"; progress?: string }> = {};
+
+function canDownload(job: Job): boolean {
+  const counts = state.jobStatus[job.jobId]?.taskRunStatusCounts ?? {};
+  return (counts.SUCCEEDED ?? 0) > 0 && downloads[job.jobId]?.status !== "DOWNLOADING";
+}
+
+function downloadText(job: Job): string | null {
+  const download = downloads[job.jobId];
+  if (download?.status !== "DOWNLOADING") {
+    return null;
+  }
+  const percent = Number(download.progress);
+  return `Downloading outputs${Number.isFinite(percent) ? ` · ${percent}%` : "…"}`;
+}
+
+async function downloadOutputs(job: Job) {
+  downloads[job.jobId] = { status: "DOWNLOADING" };
+  refresh("jobs");
+  try {
+    await postJson("/deadline/jobs/download", {
+      clientId: api.clientId,
+      farmId: job.farmId,
+      queueId: job.queueId,
+      jobId: job.jobId,
+    });
+  } catch (error) {
+    delete downloads[job.jobId];
+    toast("error", messageOf(error), 10000);
+    refresh("jobs");
+  }
+}
+
+function listenForDownloads() {
+  api.addEventListener<DownloadEvent>("deadline.download", ({ detail }) => {
+    const job = state.jobs.find((other) => other.jobId === detail.jobId);
+    const name = job?.name ?? detail.jobId;
+    if (detail.status === "DOWNLOADING") {
+      downloads[detail.jobId] = { status: "DOWNLOADING", progress: detail.progress };
+    } else {
+      delete downloads[detail.jobId];
+      if (detail.status === "DOWNLOADED" && !detail.fileCount) {
+        // The CLI's message says there was nothing to download.
+        toast("info", `${name}: ${detail.message}`, 10000);
+      } else if (detail.status === "DOWNLOADED") {
+        const directory = detail.directory ?? job?.outputDir;
+        const destination = directory
+          ? `to ${directory}`
+          : "into the output directory it was submitted with";
+        toast("success", `${detail.message} from ${name} ${destination}.`, 10000);
+      } else {
+        toast("error", `Couldn't download the outputs of ${name}. ${detail.error ?? ""}`, 15000);
+      }
+    }
+    refresh("jobs");
+  });
+}
+
+function renderJobs() {
+  if (!state.jobs.length) {
+    return null;
+  }
+  return section(
+    "Recent jobs",
+    true,
+    h(
+      "ul",
+      { className: "dl-jobs" },
+      state.jobs.map((job) =>
+        h(
+          "li",
+          { title: `${job.jobId}\nSubmitted ${new Date(job.submittedAt).toLocaleString()}` },
+          h("div", { className: "dl-path" }, job.name),
+          job.outputDir
+            ? h(
+                "div",
+                { className: "dl-path dl-muted dl-destination", title: job.outputDir },
+                `Downloads to ${job.outputDir}`
+              )
+            : null,
+          h(
+            "div",
+            { className: "dl-row dl-muted" },
+            h("span", {}, downloadText(job) ?? statusText(job)),
+            canDownload(job)
+              ? h("button", { className: "dl-link", onClick: () => downloadOutputs(job) }, "Download")
+              : null,
+            h(
+              "button",
+              {
+                className: "dl-link",
+                onClick: () => {
+                  navigator.clipboard?.writeText(job.jobId);
+                  toast("info", `Copied ${job.jobId}.`, 2000);
+                },
+              },
+              "Copy job ID"
+            )
+          )
+        )
+      )
+    ),
+    h(
+      "button",
+      {
+        className: "dl-link",
+        onClick: () => {
+          state.jobs = [];
+          writeStorage(JOBS_KEY, []);
+          refresh("jobs");
+        },
+      },
+      "Clear"
+    )
+  );
+}
+
 const RENDERERS: Record<SectionName, () => Children> = {
   account: renderAccount,
   target: renderTarget,
@@ -1418,8 +2101,10 @@ const RENDERERS: Record<SectionName, () => Children> = {
   jobSettings: renderJobSettings,
   parameters: renderParameters,
   queueParameters: renderQueueParameters,
+  hostRequirements: renderHostRequirements,
   attachments: renderAttachments,
   submit: renderSubmit,
+  jobs: renderJobs,
 };
 
 // A view renders some of the sections into a container, and re-renders them when they change.
@@ -1484,12 +2169,15 @@ export function renderPanel(element: HTMLElement): () => void {
     "jobSettings",
     "parameters",
     "queueParameters",
+    "hostRequirements",
     "attachments",
+    "jobs",
     // Last, and stuck to the bottom.
     "submit",
   ]);
   loadAccount();
   loadPlan();
+  pollJobs();
   return () => {
     views.delete(view);
   };
@@ -1598,9 +2286,13 @@ function injectStyles() {
 .dl-dialog .dl-slot-submit { padding-bottom: 4px; }
 .dl-header { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 14px; }
 .dl-slot:empty { display: none; }
+.dl-notice[hidden] { display: none; }
 .dl-grid { display: flex; flex-direction: column; gap: 8px; }
 .dl-field { display: flex; flex-direction: column; gap: 3px; margin-bottom: 6px; }
 .dl-link[hidden] { display: none; }
+.dl-range { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.dl-choices { flex-wrap: wrap; gap: 10px; }
+.dl-custom { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
 .dl-field-check { flex-direction: row-reverse; justify-content: flex-end; align-items: center; gap: 6px; }
 .dl-field-check input { margin: 0; flex: none; }
 .dl-label { color: var(--dl-muted); font-size: 12px; }
@@ -1636,10 +2328,13 @@ textarea.dl-input { resize: vertical; }
 .dl-warn-box { background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.45); }
 .dl-status { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
 .dl-summary strong { font-size: 15px; }
-.dl-files { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.dl-files, .dl-jobs { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
 .dl-files li { display: flex; align-items: center; gap: 4px; }
 .dl-removed .dl-path { text-decoration: line-through; color: var(--dl-muted); }
 .dl-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.dl-jobs li { border-bottom: 1px solid var(--dl-border); padding-bottom: 4px; }
+.dl-destination { font-size: 12px; }
+.dl-jobs .dl-row { justify-content: space-between; font-size: 12px; }
 .dl-progress { display: flex; flex-direction: column; gap: 6px; }
 .dl-progress progress { width: 100%; }
 .dl-message { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 200px; overflow-y: auto; }

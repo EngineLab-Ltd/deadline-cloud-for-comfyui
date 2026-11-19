@@ -51,8 +51,12 @@ class FakeApi:
         return {"storageProfiles": [{"storageProfileId": "sp-1", "displayName": "Mac"}]}
 
     def get_job(self, farmId, queueId, jobId, config):
-        if jobId == "job-gone":
-            raise RuntimeError("Not found")
+        if jobId in ("job-gone", "job-throttled"):
+            code = "ResourceNotFoundException" if jobId == "job-gone" else "ThrottlingException"
+            error = RuntimeError(code)
+            # As botocore's ClientError carries it.
+            error.response = {"Error": {"Code": code}}  # type: ignore[attr-defined]
+            raise error
         return {
             "name": "fox",
             "lifecycleStatus": "CREATE_COMPLETE",
@@ -316,3 +320,24 @@ def test_submit_doesnt_need_a_newer_sdk_without_a_bool_parameter(
     request = {**SUBMISSION, "bundleDir": _bundle(tmp_path, "STRING")}
     code, _ = run(monkeypatch, capsys, "submit", request, answers=[{"accept": True}])
     assert code == 0
+
+
+def test_jobs_reports_each_job(deadline_api, monkeypatch, capsys):
+    request = {
+        "farmId": "farm-1",
+        "queueId": "queue-1",
+        "jobIds": ["job-1", "job-gone", "job-throttled"],
+    }
+    _, events = run(monkeypatch, capsys, "jobs", request)
+    assert events[-1]["data"]["jobs"] == [
+        {
+            "jobId": "job-1",
+            "name": "fox",
+            "lifecycleStatus": "CREATE_COMPLETE",
+            "taskRunStatus": "RUNNING",
+            "taskRunStatusCounts": {"SUCCEEDED": 3, "RUNNING": 1},
+        },
+        # Only a job that's gone is flagged, so the panel stops asking about it.
+        {"jobId": "job-gone", "error": "ResourceNotFoundException", "notFound": True},
+        {"jobId": "job-throttled", "error": "ThrottlingException"},
+    ]

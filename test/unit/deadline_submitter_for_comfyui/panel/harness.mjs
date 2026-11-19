@@ -161,6 +161,88 @@ if (scenario === "edited-before-replanning") {
   await ui.submit();
   await settle();
   result.excludedModels = api.calls.filter(({ path }) => path === "/deadline/jobs").at(-1).body.excludedModels;
+} else if (scenario.startsWith("poll-")) {
+  // Recent jobs' status, polled through the bridge's jobs command.
+  const job = { jobId: "job-1", name: "fox", farmId: "farm-1", queueId: "queue-1", submittedAt: "" };
+  state.jobs = [job];
+  let running = 0;
+  result.mostAtOnce = 0;
+  const answer = deferred();
+  let calls = 0;
+  api.handlers["/deadline/cloud/jobs"] = async (body) => {
+    calls += 1;
+    running += 1;
+    result.mostAtOnce = Math.max(result.mostAtOnce, running);
+    if (scenario === "poll-overlapping") {
+      await answer.promise;
+    }
+    running -= 1;
+    const runningJob = { jobId: "job-1", taskRunStatus: "RUNNING", taskRunStatusCounts: { SUCCEEDED: 1 } };
+    const status =
+      scenario === "poll-error"
+        ? { jobId: "job-1", error: "Not found", notFound: true }
+        : scenario === "poll-transient" && calls === 2
+          ? { jobId: "job-1", error: "Rate exceeded" }
+          : runningJob;
+    return { jobs: [status] };
+  };
+  if (scenario === "poll-overlapping") {
+    // A job is submitted while the panel's first poll is still waiting for the bridge.
+    const first = ui.__pollJobs();
+    const second = ui.__pollJobs();
+    const third = ui.__pollJobs();
+    await settle();
+    answer.resolve();
+    await Promise.all([first, second, third]);
+  } else if (scenario === "poll-transient") {
+    // The second poll fails for a moment, such as when throttled.
+    await ui.__pollJobs();
+    await ui.__pollJobs();
+    result.statusAfterError = state.jobStatus["job-1"].taskRunStatus ?? null;
+    await ui.__pollJobs();
+  } else if (scenario === "poll-after-account") {
+    // Opening the panel loads the account, then polls straight away, not at the next timer.
+    await ui.loadAccount(true);
+    await settle();
+  } else {
+    await ui.__pollJobs();
+    await ui.__pollJobs();
+  }
+  result.polls = api.calls.filter(({ path }) => path === "/deadline/cloud/jobs").length;
+} else if (scenario === "host-round-trip") {
+  // Editing the form rebuilds the requirements from it, so it has to hold every template value.
+  const requirements = {
+    attributes: [
+      { name: "attr.worker.os.family", anyOf: ["linux"] },
+      { name: "attr.worker.cpu.arch", anyOf: ["x86_64", "aarch64"] },
+    ],
+    amounts: [{ name: "amount.worker.gpu", min: 1 }],
+  };
+  result.requirements = ui.__requirementsFromForm(ui.__formFromRequirements(requirements));
+} else if (scenario === "download-nothing") {
+  state.jobs = [{ jobId: "job-1", name: "fox", farmId: "farm-1", queueId: "queue-1", submittedAt: "" }];
+  const message = "There are no output files available for download at this moment.";
+  api.emit("deadline.download", { jobId: "job-1", status: "DOWNLOADED", message, fileCount: 0 });
+  result.toasts = app.toasts.map(({ severity, detail }) => ({ severity, detail }));
+} else if (scenario === "submitted-output-dir") {
+  api.emit("deadline.submitted", {
+    submissionId: "s-1",
+    status: "SUBMITTED",
+    name: "fox",
+    jobId: "job-1",
+    farmId: "farm-1",
+    queueId: "queue-1",
+    outputDir: "/comfy/output",
+  });
+  result.outputDir = state.jobs[0].outputDir;
+} else if (scenario.startsWith("downloaded-to-")) {
+  // The CLI's folder wins. Without one, the folder the job was submitted with is named.
+  const job = { jobId: "job-1", name: "fox", farmId: "farm-1", queueId: "queue-1", submittedAt: "" };
+  state.jobs = [scenario === "downloaded-to-unknown" ? job : { ...job, outputDir: "/comfy/output" }];
+  const directory = scenario === "downloaded-to-cli-folder" ? "/comfy/output/fox" : undefined;
+  const message = "Downloaded 2 files";
+  api.emit("deadline.download", { jobId: "job-1", status: "DOWNLOADED", message, fileCount: 2, directory });
+  result.toasts = app.toasts.map(({ detail }) => detail);
 }
 console.log(JSON.stringify(result));
 process.exit(0);

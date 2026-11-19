@@ -31,6 +31,8 @@ JOB_SETTINGS = {
     "requirePathsExist": "require_paths_exist",
 }
 SUBMITTER_NAME = "ComfyUI"
+# How many jobs one status request can ask about.
+MAX_JOBS = 50
 # The fewest seconds between progress events of a stage, so a big upload doesn't flood ComfyUI.
 PROGRESS_INTERVAL = 1.0
 
@@ -147,6 +149,41 @@ def set_defaults(request: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+# Errors that mean the job is gone, or that these credentials can't see it, rather than a failure
+# worth trying again, such as throttling or expired credentials.
+JOB_GONE_ERRORS = {"ResourceNotFoundException", "AccessDeniedException"}
+
+
+def jobs(request: dict[str, Any]) -> dict[str, Any]:
+    from deadline.client import api
+
+    config = _config({})
+    found = []
+    for job_id in list(request.get("jobIds", []))[:MAX_JOBS]:
+        try:
+            job = api.get_job(
+                farmId=request["farmId"], queueId=request["queueId"], jobId=job_id, config=config
+            )
+        except Exception as e:  # noqa: BLE001 - one missing job mustn't hide the others.
+            response = getattr(e, "response", None)
+            code = response.get("Error", {}).get("Code") if isinstance(response, dict) else None
+            status: dict[str, Any] = {"jobId": job_id, "error": str(e)}
+            if code in JOB_GONE_ERRORS:
+                status["notFound"] = True
+            found.append(status)
+            continue
+        found.append(
+            {
+                "jobId": job_id,
+                "name": job.get("name"),
+                "lifecycleStatus": job.get("lifecycleStatus"),
+                "taskRunStatus": job.get("taskRunStatus"),
+                "taskRunStatusCounts": job.get("taskRunStatusCounts", {}),
+            }
+        )
+    return {"jobs": found}
+
+
 def _progress(stage: str) -> Callable[[Any], bool]:
     last = [float("-inf")]
 
@@ -245,6 +282,7 @@ COMMANDS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "queues": queues,
     "queue": queue,
     "set-defaults": set_defaults,
+    "jobs": jobs,
     "submit": submit,
 }
 

@@ -418,7 +418,91 @@ def read_job_template(template: Path) -> dict[str, Any]:
     return base
 
 
+# The worker capabilities that the panel has their own fields for. Other names are custom ones.
+HOST_AMOUNTS = (
+    "amount.worker.vcpu",
+    "amount.worker.memory",
+    "amount.worker.gpu",
+    "amount.worker.gpu.memory",
+    "amount.worker.disk.scratch",
+)
+HOST_ATTRIBUTES = ("attr.worker.os.family", "attr.worker.cpu.arch")
+# OpenJD saves these first identifiers for its own capabilities and variables.
+_RESERVED_CAPABILITY_NAMES = ("worker", "job", "step", "task")
+_CAPABILITY_NAME = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]{0,63}(\.[a-zA-Z_][a-zA-Z0-9_]{0,63})*")
+_ATTRIBUTE_VALUE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_-]{0,99}")
 MAX_JOB_DESCRIPTION = 2048
+
+
+def _capability_name(name: Any, prefix: str, standard: tuple[str, ...]) -> str:
+    if name in standard:
+        return name
+    custom = name[len(prefix) :] if isinstance(name, str) and name.startswith(prefix) else ""
+    if not _CAPABILITY_NAME.fullmatch(custom) or custom.split(".")[0] in _RESERVED_CAPABILITY_NAMES:
+        reserved = ", ".join(_RESERVED_CAPABILITY_NAMES)
+        raise SubmitError(
+            f"Host requirement {name!r} needs a name of letters, numbers and underscores, "
+            f"separated by periods, that doesn't start with {reserved}."
+        )
+    return name
+
+
+def _host_amount(amount: Any) -> dict[str, Any]:
+    if not isinstance(amount, dict):
+        raise SubmitError("Each host requirement amount must be an object.")
+    name = _capability_name(amount.get("name"), "amount.", HOST_AMOUNTS)
+    result: dict[str, Any] = {"name": name}
+    for key in ("min", "max"):
+        value = amount.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            raise SubmitError(f"The {key} of host requirement {name} must be a positive number.")
+        result[key] = value
+    if len(result) == 1:
+        raise SubmitError(f"Host requirement {name} needs a min or a max.")
+    if result.get("min", 0) > result.get("max", float("inf")):
+        raise SubmitError(f"The min of host requirement {name} is more than its max.")
+    return result
+
+
+def _host_attribute(attribute: Any) -> dict[str, Any]:
+    if not isinstance(attribute, dict):
+        raise SubmitError("Each host requirement attribute must be an object.")
+    name = _capability_name(attribute.get("name"), "attr.", HOST_ATTRIBUTES)
+    modes = [mode for mode in ("anyOf", "allOf") if mode in attribute]
+    if len(modes) != 1:
+        raise SubmitError(f"Host requirement {name} needs either anyOf or allOf.")
+    values = attribute[modes[0]]
+    if (
+        not isinstance(values, list)
+        or not values
+        or not all(isinstance(value, str) and _ATTRIBUTE_VALUE.fullmatch(value) for value in values)
+    ):
+        raise SubmitError(
+            f"Host requirement {name} needs values of letters, numbers, underscores and dashes, "
+            "each starting with a letter or underscore."
+        )
+    return {"name": name, modes[0]: values}
+
+
+def host_requirements(value: Any) -> dict[str, Any] | None:
+    """
+    Checks the panel's host requirements. None keeps the job template's, and an empty result
+    removes them, so the job runs on any worker. Raises SubmitError.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise SubmitError("hostRequirements must be an object.")
+    result: dict[str, Any] = {}
+    for key, check in (("attributes", _host_attribute), ("amounts", _host_amount)):
+        listed = value.get(key) or []
+        if not isinstance(listed, list):
+            raise SubmitError(f"hostRequirements.{key} must be a list.")
+        if listed:
+            result[key] = [check(item) for item in listed]
+    return result
 
 
 def job_description(value: Any) -> str | None:
@@ -432,25 +516,41 @@ def job_description(value: Any) -> str | None:
     return value
 
 
+def template_host_requirements(job_template: dict[str, Any]) -> dict[str, Any]:
+    """The host requirements of the job template's first step, for the panel to start from."""
+    steps = job_template.get("steps")
+    first = steps[0] if isinstance(steps, list) and steps else None
+    requirements = first.get("hostRequirements") if isinstance(first, dict) else None
+    return requirements if isinstance(requirements, dict) else {}
+
+
 def create_job_bundle(
     template: Path,
     workflow: dict[str, Any],
     name: str,
     dest_dir: Path,
     now: datetime | None = None,
+    requirements: dict[str, Any] | None = None,
     description: str | None = None,
 ) -> tuple[Path, Path]:
     """
     Creates <dest_dir>/<timestamp>_<name>/ with the job template and the API-format workflow, and
     returns the bundle directory and the workflow file. They have to outlive the submitter dialog
     and the job attachments upload. The template is copied as it is, unless the artist changed its
-    description.
+    host requirements or description.
     """
     suffix = ".json" if template.suffix.lower() == ".json" else ".yaml"
     text = None
-    if description:
+    if requirements is not None or description:
         job_template = read_job_template(template)
-        job_template["description"] = description
+        if description:
+            job_template["description"] = description
+        if requirements is not None:
+            for step in job_template.get("steps") or []:
+                if requirements:
+                    step["hostRequirements"] = requirements
+                else:
+                    step.pop("hostRequirements", None)
         text = (
             json.dumps(job_template, indent=2)
             if suffix == ".json"

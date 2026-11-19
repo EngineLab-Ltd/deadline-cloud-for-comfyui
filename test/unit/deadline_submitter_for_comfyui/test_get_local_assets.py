@@ -539,7 +539,17 @@ def test_stage_local_node_packs_leaves_out_files_that_can_hold_credentials(comfy
     """An API-backed pack can keep its keys in its folder, and anyone who can use the queue can
     read job attachments."""
     pack = comfy["custom_nodes"] / "api-nodes"
-    for kept in ("__init__.py", "config.json", "keys/README.md", ".env.py/__init__.py"):
+    # The pack's own code stays, even when it's named like a credentials file.
+    kept_files = (
+        "__init__.py",
+        "config.json",
+        "keys/README.md",
+        ".env.py/__init__.py",
+        "credentials.py",
+        "auth/Credentials.py",
+        "auth/.env.py",
+    )
+    for kept in kept_files:
         touch(pack / kept)
     for secret in (
         ".env",
@@ -547,6 +557,7 @@ def test_stage_local_node_packs_leaves_out_files_that_can_hold_credentials(comfy
         "certs/client.pem",
         "api.KEY",
         "credentials",
+        "credentials.json",
         "secrets.json",
     ):
         touch(pack / secret)
@@ -555,7 +566,7 @@ def test_stage_local_node_packs_leaves_out_files_that_can_hold_credentials(comfy
     files = sorted(
         p.relative_to(dest / "api-nodes").as_posix() for p in dest.rglob("*") if p.is_file()
     )
-    assert files == [".env.py/__init__.py", "__init__.py", "config.json", "keys/README.md"]
+    assert files == sorted(kept_files)
     assert "can hold credentials" in caplog.text
 
 

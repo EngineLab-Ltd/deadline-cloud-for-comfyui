@@ -236,7 +236,11 @@ _SECRET_NODE_FILES = (
     "id_ed25519",
     ".netrc",
     "credentials",
-    "credentials.*",
+    "credentials.json",
+    "credentials.toml",
+    "credentials.yaml",
+    "credentials.yml",
+    "credentials.ini",
     "secrets.json",
     "secrets.toml",
     "secrets.yaml",
@@ -245,7 +249,11 @@ _SECRET_NODE_FILES = (
 
 
 def _is_secret_node_file(name: str) -> bool:
-    return any(fnmatch.fnmatch(name.lower(), pattern) for pattern in _SECRET_NODE_FILES)
+    name = name.lower()
+    # A Python file is the pack's own code, such as a credentials.py that its nodes import.
+    if name.endswith(".py"):
+        return False
+    return any(fnmatch.fnmatch(name, pattern) for pattern in _SECRET_NODE_FILES)
 
 
 def _ignore_node_files(directory: str, names: list[str]) -> set[str]:

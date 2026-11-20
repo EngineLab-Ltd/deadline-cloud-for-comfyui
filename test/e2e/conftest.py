@@ -36,6 +36,9 @@ from playwright.sync_api import Page, expect
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXTENSION_DIR_NAME = "deadline-cloud-for-comfyui"
 WEB_DIRECTORY = REPO_ROOT / "src" / "deadline" / "comfyui_submitter" / "web"
+# Where frontend/tsconfig.json compiles WEB_DIRECTORY from: each source's JavaScript lands at
+# the same place relative to the web folder as the source relative to this one.
+PANEL_SOURCES = REPO_ROOT / "frontend" / "src" / "extensions" / "deadline-cloud"
 # How long ComfyUI can take to start, importing torch and its other requirements.
 STARTUP_TIMEOUT_SECONDS = 300
 # The fake Deadline Cloud account the tests submit to, and the environment variables of
@@ -88,8 +91,24 @@ def _python(checkout: Path) -> str | None:
 
 
 def _build_panel() -> None:
-    """Compiles the panel's TypeScript into the extension's web folder, when it's missing."""
-    if any(WEB_DIRECTORY.rglob("*.js")):
+    """Compiles the panel's TypeScript into the extension's web folder, when it's missing or
+    older than its sources.
+
+    ComfyUI serves everything in the web folder, so the panel counts as compiled only when it
+    holds exactly one JavaScript file per TypeScript source, none older than its source: a
+    leftover from before a source was renamed would run as if it belonged, and a stale file
+    would put the tests a change behind. Anything else clears the folder for a fresh build,
+    since tsc never removes what's already there.
+    """
+    sources = [path for path in PANEL_SOURCES.rglob("*.ts") if not path.name.endswith(".d.ts")]
+    outputs = [
+        WEB_DIRECTORY / path.relative_to(PANEL_SOURCES).with_suffix(".js") for path in sources
+    ]
+    up_to_date = set(outputs) == set(WEB_DIRECTORY.rglob("*.js")) and all(
+        output.is_file() and output.stat().st_mtime >= source.stat().st_mtime
+        for source, output in zip(sources, outputs)
+    )
+    if up_to_date:
         return
     npm = shutil.which("npm")
     if npm is None:
@@ -97,6 +116,7 @@ def _build_panel() -> None:
     frontend = REPO_ROOT / "frontend"
     if not (frontend / "node_modules").is_dir():
         subprocess.run([npm, "ci"], cwd=frontend, check=True)
+    shutil.rmtree(WEB_DIRECTORY, ignore_errors=True)
     subprocess.run([npm, "run", "build"], cwd=frontend, check=True)
 
 
@@ -115,6 +135,7 @@ def _wait_for_extension(url: str, process: subprocess.Popen[bytes], log: Path) -
                 if EXTENSION_DIR_NAME in response.read().decode("utf-8", errors="replace"):
                     return
         except (urllib.error.URLError, TimeoutError, OSError):
+            # Continue waiting; if the timeout expires, Pytest will fail.
             pass
         if time.monotonic() > deadline:
             break

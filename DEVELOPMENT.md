@@ -21,7 +21,7 @@ npm ci
 | `__init__.py` | The ComfyUI custom-node entry point. ComfyUI imports it from `custom_nodes/`. |
 | `install_submitter.py` | The setup script for users. It's tested in `test/unit/test_install_submitter.py`. |
 | `src/deadline/comfyui_submitter/submit.py` | Pure helpers for building the submitter command. They don't import ComfyUI, so they're unit tested. |
-| `src/deadline/comfyui_submitter/routes.py` | The `/deadline/...` routes on the ComfyUI server: `plan`, `cloud/<command>`, `jobs`, `jobs/download`, `bundle` and `choose`. |
+| `src/deadline/comfyui_submitter/routes.py` | The `/deadline/...` routes on the ComfyUI server: `plan`, `cloud/<command>`, `bundle`, `jobs`, `jobs/confirm`, `jobs/cancel`, `jobs/download` and `choose`. |
 | `src/deadline/comfyui_submitter/bridge.py` | Calls `deadline.client.api` for the routes. It runs in the Deadline Cloud CLI's Python (`python -I bridge.py <command>`) and speaks JSON lines, so it only imports the standard library and `deadline`. |
 | `frontend/src/extensions/deadline-cloud/` | The frontend extension's TypeScript. `deadline_submit.ts` registers the commands, the action bar button and the sidebar tab; `deadline_ui.ts` is the panel and the dialog, in plain DOM with ComfyUI's theme variables. The folder mirrors where ComfyUI serves the extension, so imports such as `../../scripts/app.js` resolve to the type declarations in `frontend/src/scripts/`. |
 | `src/deadline/comfyui_submitter/web/` | The compiled JavaScript that ComfyUI serves. It's built by `npm run build` in `frontend/`, which `install_submitter.py` runs, and isn't committed. |
@@ -95,8 +95,9 @@ The e2e tests in `test/e2e` drive the panel's compiled JavaScript in a real Comf
 [Playwright](https://playwright.dev/python/). Each test case lives in its own `test_scripts`
 subdirectory with the workflow file it runs, the values it changes in the UI, and the expected
 job bundle. The Deadline Cloud tools are faked for the ComfyUI server, so no credentials are
-needed: the test changes values in the panel's GUI and submits, and the job bundle the
-submitter creates must match the expected one.
+needed. The test changes values in the panel's GUI, saves the job bundle, and then submits it: a
+successfully submitted bundle is removed once it's uploaded, but a saved one is kept, to submit
+later with `deadline bundle submit`, so the saved bundle is what must match the expected one.
 
 Tests need a ComfyUI checkout with its requirements installed:
 
@@ -110,4 +111,4 @@ The panel is compiled first when needed (`npm ci` and `npm run build` in `fronte
 ComfyUI is started with this checkout linked in as its only custom node, a fresh base directory
 and a free port. Without `COMFYUI_PATH` the tests skip, so `hatch run test` stays hermetic;
 `COMFYUI_PYTHON` picks the interpreter that launches ComfyUI when it isn't the default. The
-**E2E** workflow runs the suite on Ubuntu against the ComfyUI release named above as the minimum.
+e2e hatch environment downloads Playwright's Chromium when it's created.

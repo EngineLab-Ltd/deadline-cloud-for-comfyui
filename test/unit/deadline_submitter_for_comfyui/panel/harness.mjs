@@ -36,6 +36,20 @@ function jobs() {
       clientId: body.clientId,
     }));
 }
+function emitConfirmation(message = "Upload?", defaultAnswer = true) {
+  try {
+    api.emit("deadline.confirm", {
+      submissionId: state.submission.id,
+      message,
+      default: defaultAnswer,
+    });
+  } catch {
+    // Without a document, opening the dialog fails after the prompt has been recorded.
+  }
+}
+function confirmationAnswers() {
+  return api.calls.filter(({ path }) => path === "/deadline/jobs/confirm").map(({ body }) => body);
+}
 
 api.handlers["/deadline/cloud/status"] = async () => ({
   authenticationStatus: "AUTHENTICATED",
@@ -51,7 +65,42 @@ await ui.loadPlan(true);
 const result = {};
 const scenario = process.argv[2];
 
-if (scenario === "edited-before-replanning") {
+if (scenario === "answer-confirmation") {
+  state.submission = { id: "a".repeat(32), starting: false };
+  emitConfirmation();
+  api.handlers["/deadline/jobs/confirm"] = async () => ({});
+  await ui.__answerConfirmation(true);
+  // Clicking again cannot send an answer once the pending prompt has been cleared.
+  await ui.__answerConfirmation(true);
+  result.answers = confirmationAnswers();
+  result.pending = state.submission.confirm;
+} else if (scenario === "answer-while-next-prompt-arrives") {
+  state.submission = { id: "a".repeat(32), starting: false };
+  emitConfirmation();
+  const firstResponse = deferred();
+  api.handlers["/deadline/jobs/confirm"] = async (body) => {
+    if (body.accept) {
+      emitConfirmation("Run hooks?", false);
+      await firstResponse.promise;
+    }
+    return {};
+  };
+  const firstAnswer = ui.__answerConfirmation(true);
+  await settle();
+  result.answersWhileFirstPending = confirmationAnswers();
+  result.nextPrompt = state.submission.confirm;
+  firstResponse.resolve();
+  await firstAnswer;
+  // Completing the old answer must preserve the next prompt until it is answered separately.
+  await ui.__answerConfirmation(false);
+  result.answers = confirmationAnswers();
+  result.pending = state.submission.confirm;
+} else if (scenario === "cancel-submission") {
+  state.submission = { id: "a".repeat(32), starting: false };
+  api.handlers["/deadline/jobs/cancel"] = async () => ({});
+  await ui.__cancelSubmission();
+  result.cancels = api.calls.filter(({ path }) => path === "/deadline/jobs/cancel").map(({ body }) => body);
+} else if (scenario === "edited-before-replanning") {
   // The artist edits the graph and submits before the debounced plan request starts.
   app.image = "new.png";
   await ui.submit();

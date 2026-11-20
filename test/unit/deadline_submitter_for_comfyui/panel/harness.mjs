@@ -172,6 +172,21 @@ if (scenario === "answer-confirmation") {
   result.cleared = "CondaChannels" in api.calls.at(-1).body.parameters
     ? api.calls.at(-1).body.parameters.CondaChannels
     : null;
+} else if (scenario === "save-bundle") {
+  api.handlers["/deadline/bundle"] = async () => ({
+    job_bundle: "/bundle",
+    command: "deadline bundle submit /bundle --farm-id farm-1",
+  });
+  state.jobName = "Fox lookdev";
+  await ui.__saveBundle();
+  const { body } = api.calls.find(({ path }) => path === "/deadline/bundle");
+  result.sent = {
+    farmId: body.farmId,
+    queueId: body.queueId,
+    storageProfileId: body.storageProfileId,
+    name: body.settings.name,
+  };
+  result.toasts = app.toasts.map(({ detail }) => detail);
 } else if (scenario.startsWith("early-")) {
   // The server's event arrives before the response to the submission request.
   const response = deferred();

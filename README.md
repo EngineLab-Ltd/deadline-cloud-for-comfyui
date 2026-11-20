@@ -136,7 +136,6 @@ the environment that starts ComfyUI.
 | `COMFYUI_DEADLINE_CONDA_CHANNELS` | `conda_channels` in the config | Optional **Conda Channels** to fill in. When neither is set, the queue's default, the Deadline Cloud channels, is used. |
 | `COMFYUI_DEADLINE_CONFIG` | `deadline_cloud_submitter.json` in the extension folder | Another config file to read. |
 | `COMFYUI_DEADLINE_JOB_TEMPLATE` | The extension's job template | A job template file, YAML or JSON, to submit instead, such as your studio's version of the extension's template. It needs the same parameters, such as `WorkflowFile`, `InputDir` and `OutputDir`. Local models are attached only when the template also defines `ModelDirectory`, and it has to point ComfyUI at that folder. Custom node packs are attached only when the template defines `CustomNodesDirectory`, and it has to add that folder to ComfyUI's `custom_nodes` paths. The extension's template does both. |
-| `COMFYUI_DEADLINE_ALLOW_REMOTE` | unset | Set it to `1` to accept submit requests from browsers on other machines or through a reverse proxy. See [Security](#security) first. |
 
 ## The job
 
@@ -230,12 +229,13 @@ the same machine.
 
 **What the extension adds.**
 
-- The routes only accept a browser on the ComfyUI machine. A request from another address, or one
+- The routes require a loopback peer address. A request from another address, or one
   with a `Forwarded`, `X-Forwarded-For` or `X-Real-IP` header from a reverse proxy, gets a 403.
 - They only accept requests addressed to `localhost` or a loopback address such as `127.0.0.1`,
   so a website that points its own domain name at this machine can't pass for ComfyUI's page.
 - They refuse requests that a browser marks as coming from another website, even when
-  `--enable-cors-header` turns off ComfyUI's own check.
+  `--enable-cors-header` turns off ComfyUI's own check. When an `Origin` header is present, its
+  scheme, host and port must match the ComfyUI request, even without browser fetch metadata.
 - They only accept JSON, which a page from another website can't send without the server's
   permission.
 - Submission progress, confirmation prompts and errors, and download progress go only to the
@@ -252,11 +252,12 @@ the same machine.
   are left out. A pack's settings files, such as `config.json`, are attached as they are, so keep
   API keys in environment variables on the workers instead.
 
-**Sharing a server.** `COMFYUI_DEADLINE_ALLOW_REMOTE=1` turns off the local-only check, including
-for requests through a proxy. Only set it when every person who can reach ComfyUI may submit with
-its credentials. The server's network or reverse proxy then has to limit who can reach it, for
-example with authentication at the proxy or a private network, because ComfyUI and the extension
-don't check who's calling.
+**Local access.** Use a browser on the machine running ComfyUI and access it through
+`localhost`.
+
+The Host and Origin checks stay enabled. DNS rebinding can let another website call a reachable
+server by pointing its domain name at that server. The routes require a local Host and reject
+any Origin that does not match the request's scheme, host and port.
 
 ## Limitations
 

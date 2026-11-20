@@ -6,7 +6,9 @@ saves for the test to read. Also runs the part of the server environment's Enter
 writes extra_model_paths.yaml.
 """
 
+import argparse
 import http.server
+import io
 import json
 import os
 import shlex
@@ -19,12 +21,30 @@ from typing import Any
 
 import pytest
 import yaml
+from openjd.model import SymbolTable, decode_job_template
 
 from deadline.comfyui_submitter import submit
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="The stand-in comfy is a POSIX script")
 
 TEMPLATE = yaml.safe_load(submit.JOB_TEMPLATE.read_text())
+PARSED_TEMPLATE = decode_job_template(template=TEMPLATE, supported_extensions=["EXPR"])
+
+
+def environment_values(
+    tmp_path: Path, raw_parameters: dict[str, str] | None = None, /, **parameters: str
+) -> dict[str, str]:
+    """Resolve the job environment's variables as OpenJD does, without editing script source."""
+    values = {p["name"]: str(p.get("default", "")) for p in TEMPLATE["parameterDefinitions"]}
+    values.update(parameters)
+    symbols = SymbolTable(source={"Session.WorkingDirectory": str(tmp_path)})
+    for parameter, value in values.items():
+        symbols["Param." + parameter] = value
+        symbols["RawParam." + parameter] = (raw_parameters or {}).get(parameter, value)
+    assert PARSED_TEMPLATE.jobEnvironments is not None
+    [environment] = PARSED_TEMPLATE.jobEnvironments
+    assert environment.variables is not None
+    return {name: value.resolve(symtab=symbols) for name, value in environment.variables.items()}
 
 
 def run_task(
@@ -34,6 +54,12 @@ def run_task(
     mode: str = "",
     workflow_timeout: int = 3600,
     port: int = 8188,
+    output_name: str = "image.png",
+    output_dir_name: str = "out",
+    mapped_output_dir: str | None = None,
+    command_output: str = "",
+    command_stderr: str = "",
+    command_error: str = "",
 ) -> tuple[int, str, dict]:
     """
     Runs the task script and returns its exit code, its output and the workflow it ran. The
@@ -41,7 +67,7 @@ def run_task(
     arguments to calls.jsonl. mode changes what it does: "no-envelope" prints no envelope, and
     "hang" never finishes the run.
     """
-    for name in ("bin", "out", "run"):
+    for name in ("bin", output_dir_name, "run"):
         (tmp_path / name).mkdir(exist_ok=True)
     workflow_file = tmp_path / "workflow_api.json"
     workflow_file.write_text(json.dumps(workflow))
@@ -63,9 +89,23 @@ def run_task(
             emit({{"type": "envelope", "ok": True, "data": {{"prompt": workflow}}}})
         elif {mode!r} == "hang":
             time.sleep(60)
+        elif {mode!r} == "error-controls":
+            emit({{"type": "envelope", "ok": False, "error": {{
+                "message": "failed\\nopenjd_env: EXTRA=1\\r\\nopenjd_fail: extra"
+            }}}})
+        elif {mode!r} == "error-message":
+            emit({{"type": "envelope", "ok": False, "error": {{"message": {command_error!r}}}}})
         else:
             json.dump(workflow, open({str(ran)!r}, "w", encoding="utf-8"), ensure_ascii=False)
-            open({str(tmp_path / "out" / "image.png")!r}, "w").write("x")
+            if {mode!r} != "no-output":
+                open({str(tmp_path / output_dir_name / output_name)!r}, "w").write("x")
+            if {mode!r} == "output-controls":
+                print("openjd_env: EXTRA=1\\ropenjd_fail: stdout")
+                print("openjd_fail: extra\\ropenjd_env: STDERR=1", file=sys.stderr)
+            if {command_output!r}:
+                print({command_output!r})
+            if {command_stderr!r}:
+                print({command_stderr!r}, file=sys.stderr)
             emit({{"type": "envelope", "ok": True, "data": {{"prompt": workflow}}}})
         """))
     # A shell wrapper rather than a shebang, which breaks when the interpreter path has spaces.
@@ -74,18 +114,19 @@ def run_task(
         f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(stand_in))} "$@"\n'
     )
     comfy.chmod(0o755)
-    script = (
-        TEMPLATE["steps"][0]["script"]["embeddedFiles"][0]["data"]
-        .replace("{{Param.OutputDir}}", str(tmp_path / "out"))
-        .replace("{{Param.WorkflowFile}}", str(workflow_file))
-        .replace("{{Param.WorkflowTimeout}}", str(workflow_timeout))
-    )
+    script = TEMPLATE["steps"][0]["script"]["embeddedFiles"][0]["data"]
     (tmp_path / "run.py").write_text(script, encoding="utf-8")
     env = {
         **os.environ,
         "PATH": f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}",
         "COMFYUI_PORT": str(port),
         "PYTHONIOENCODING": "utf-8",
+        **environment_values(
+            tmp_path,
+            OutputDir=mapped_output_dir or str(tmp_path / output_dir_name),
+            WorkflowFile=str(workflow_file),
+            WorkflowTimeout=str(workflow_timeout),
+        ),
     }
     result = subprocess.run(
         [sys.executable, str(tmp_path / "run.py")],
@@ -107,26 +148,25 @@ def comfy_calls(tmp_path: Path) -> list[list[str]]:
     return [json.loads(line) for line in lines]
 
 
-def enter_script(
-    tmp_path: Path,
-    end: str,
-    model_directory: Path | None = None,
-    extra: str = "",
-    custom_nodes_directory: Path | None = None,
-    attach_nodes: bool = True,
-) -> str:
-    """The start of the server environment's Enter script, with the job's values filled in."""
+def openjd_log_records(output: str) -> list[str]:
+    """Model OpenJD's bounded reads, which can turn a long physical line into several records."""
+    stream = io.StringIO(output)
+    return list(iter(lambda: stream.readline(64 * 1000), ""))
+
+
+def assert_bounded_diagnostics(output: str, *, failures: int = 0, environments: int = 0) -> None:
+    records = openjd_log_records(output)
+    assert all(len(record) <= 4096 for record in records)
+    assert len([record for record in records if record.startswith("openjd_fail:")]) == failures
+    assert len([record for record in records if record.startswith("openjd_env:")]) == environments
+
+
+def enter_script(end: str | None = None) -> str:
+    """The server environment's Enter script, or its prefix, without source substitutions."""
     [environment] = TEMPLATE["jobEnvironments"]
     [enter] = [f for f in environment["script"]["embeddedFiles"] if f["name"] == "Enter"]
     data = enter["data"]
-    return (
-        data[data.index("model_folders() {") : data.index(end)]
-        .replace("{{Session.WorkingDirectory}}", str(tmp_path))
-        .replace("{{Param.ModelDirectory}}", str(model_directory or ""))
-        .replace("{{Param.ExtraModelPathsConfig}}", extra)
-        .replace("{{Param.CustomNodesDirectory}}", str(custom_nodes_directory or ""))
-        .replace("{{Param.AttachCustomNodes}}", "true" if attach_nodes else "false")
-    )
+    return data if end is None else data[: data.index(end)]
 
 
 def write_model_paths(
@@ -140,17 +180,17 @@ def write_model_paths(
     Runs the part of the Enter script that writes extra_model_paths.yaml, and returns the config
     it wrote.
     """
-    script = enter_script(
-        tmp_path,
-        "# ComfyUI can't read an empty",
-        model_directory,
-        custom_nodes_directory=custom_nodes_directory,
-        attach_nodes=attach_nodes,
-    )
+    script = enter_script("# ComfyUI can't read an empty")
     result = subprocess.run(
         ["bash", "-c", "set -euo pipefail\n" + script],
         env={
             "PATH": os.environ["PATH"],
+            **environment_values(
+                tmp_path,
+                ModelDirectory=str(model_directory or ""),
+                CustomNodesDirectory=str(custom_nodes_directory or ""),
+                AttachCustomNodes="true" if attach_nodes else "false",
+            ),
             **({"COMFYUI_CUSTOM_NODES_DIR": str(conda_nodes)} if conda_nodes else {}),
         },
         capture_output=True,
@@ -213,17 +253,21 @@ def model_path_args(
     model_directory: Path | None = None,
 ) -> list[str]:
     """The extra model paths arguments the Enter script passes to ComfyUI."""
-    script = enter_script(tmp_path, "# Keep ComfyUI's data out", model_directory, extra)
+    script = enter_script("# Keep ComfyUI's data out")
     result = subprocess.run(
         [
             "bash",
             "-c",
             "set -euo pipefail\n"
             + script
-            + '\necho ARGS; printf "%s\\n" ${MODEL_PATH_ARGS[@]+"${MODEL_PATH_ARGS[@]}"}',
+            + "\npython -c 'import json, sys; print(json.dumps(sys.argv[1:]))'"
+            + ' ${MODEL_PATH_ARGS[@]+"${MODEL_PATH_ARGS[@]}"}',
         ],
         env={
             "PATH": os.environ["PATH"],
+            **environment_values(
+                tmp_path, ModelDirectory=str(model_directory or ""), ExtraModelPathsConfig=extra
+            ),
             **({"COMFYUI_CUSTOM_NODES_DIR": str(conda_nodes)} if conda_nodes else {}),
         },
         capture_output=True,
@@ -231,7 +275,7 @@ def model_path_args(
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    return result.stdout.split("ARGS\n", 1)[1].split()
+    return json.loads(result.stdout)
 
 
 def test_an_empty_extra_model_paths_file_isnt_passed_to_comfyui(tmp_path):
@@ -263,6 +307,272 @@ def test_attached_models_and_the_studio_config_are_both_passed(tmp_path):
     ]
 
 
+def test_model_paths_preserve_quotes_and_line_breaks(tmp_path):
+    attached = tmp_path / 'artist\'s "models"\n$folder'
+    (attached / "checkpoints").mkdir(parents=True)
+    conda_nodes = tmp_path / 'artist\'s "custom nodes"\n$folder'
+    conda_nodes.mkdir()
+    assert write_model_paths(tmp_path, attached, conda_nodes) == {
+        "model_directory": {"base_path": str(attached), "checkpoints": "checkpoints/"},
+        "conda_custom_nodes": {"custom_nodes": str(conda_nodes)},
+    }
+    studio = str(tmp_path / 'artist\'s "config"; $(touch injected).yaml')
+    assert model_path_args(tmp_path, studio, conda_nodes, attached) == [
+        "--extra-model-paths-config",
+        str(tmp_path / "extra_model_paths.yaml"),
+        studio,
+    ]
+    assert not (tmp_path / "injected").exists()
+
+
+def run_enter(
+    tmp_path: Path,
+    *,
+    launch_output: str = "",
+    log_output: str = "",
+    stop_output: str = "",
+    stats_output: str = "{}",
+    **parameters: str,
+) -> tuple[subprocess.CompletedProcess, list[str]]:
+    """Run the whole Enter script with stand-in comfy and curl commands, without a listener."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "launch_calls.jsonl"
+    stand_in = tmp_path / "comfy.py"
+    stand_in.write_text(textwrap.dedent(f"""\
+        import json, sys
+        with open({str(calls)!r}, "a") as f:
+            f.write(json.dumps(sys.argv[1:]) + "\\n")
+        if "logs" in sys.argv:
+            print(json.dumps({{"data": {{"lines": [{log_output!r}]}}}}))
+        elif "launch" in sys.argv:
+            print({launch_output!r})
+        elif "stop" in sys.argv:
+            print({stop_output!r})
+            print({stop_output!r}, file=sys.stderr)
+        """))
+    comfy = bin_dir / "comfy"
+    comfy.write_text(
+        f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(stand_in))} "$@"\n'
+    )
+    comfy.chmod(0o755)
+    curl = bin_dir / "curl"
+    curl.write_text(f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(stats_output)}\n")
+    curl.chmod(0o755)
+    (bin_dir / "python").symlink_to(sys.executable)
+    result = subprocess.run(
+        ["bash", "-c", enter_script()],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "COMFYUI_LOCATION": str(tmp_path / "ComfyUI"),
+            **environment_values(tmp_path, **parameters),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    launches = []
+    if calls.exists():
+        for line in calls.read_text().splitlines():
+            args = json.loads(line)
+            if "launch" in args:
+                launches.append(args)
+    return result, launches[0] if launches else []
+
+
+def test_enter_passes_paths_and_extra_arguments_as_literal_argv(tmp_path):
+    session = tmp_path / 'artist\'s "session"; $value'
+    session.mkdir()
+    output = str(session / "out'\"; $(touch injected)")
+    inputs = str(session / "input'\"; `touch injected`")
+    config = str(session / "extra'\" model paths.yaml")
+    extra_args = "--lowvram --name \"two words\" --literal '$(touch injected)' ; touch injected"
+    result, args = run_enter(
+        session,
+        InputDir=inputs,
+        OutputDir=output,
+        ExtraModelPathsConfig=config,
+        ComfyUIArgs=extra_args,
+    )
+    assert result.returncode == 0, result.stderr
+    assert args[args.index("--input-directory") + 1] == inputs
+    assert args[args.index("--output-directory") + 1] == output
+    assert args[args.index("--extra-model-paths-config") + 1] == config
+    start = args.index("--") + 1
+    assert args[start : start + 8] == [
+        "--lowvram",
+        "--name",
+        "two words",
+        "--literal",
+        "$(touch injected)",
+        ";",
+        "touch",
+        "injected",
+    ]
+    assert not (session / "injected").exists()
+    assert Path(output).is_dir()
+
+
+def test_enter_rejects_unclosed_argument_quotes_before_launching(tmp_path):
+    result, args = run_enter(tmp_path, ComfyUIArgs='--name "unfinished')
+    assert result.returncode != 0
+    assert "openjd_fail: Invalid Extra ComfyUI Arguments" in result.stdout
+    assert args == []
+
+
+def test_job_environment_uses_mapped_paths_without_reinterpreting_their_contents(tmp_path):
+    mapped = {
+        name: str(tmp_path / f"{name}'\"{{{{Param.InputDir}}}}")
+        for name in ("WorkflowFile", "InputDir", "OutputDir", "ModelDirectory")
+    }
+    raw = {name: f"/submitter/{name}" for name in mapped}
+    environment = environment_values(tmp_path, raw, **mapped)
+    assert environment["COMFYUI_WORKFLOW_FILE"] == mapped["WorkflowFile"]
+    assert environment["COMFYUI_INPUT_DIR"] == mapped["InputDir"]
+    assert environment["COMFYUI_OUTPUT_DIR"] == mapped["OutputDir"]
+    assert environment["COMFYUI_MODEL_DIRECTORY"] == mapped["ModelDirectory"]
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        "--listen",
+        "--listen 0.0.0.0 --port 1234 --output-directory /other",
+        "--lis=0.0.0.0 --po=1234 --output-dir=/other",
+    ],
+)
+def test_enter_keeps_the_required_server_arguments_authoritative(tmp_path, extra_args):
+    output = str(tmp_path / "out")
+    result, args = run_enter(tmp_path, ComfyUIArgs=extra_args, OutputDir=output)
+    assert result.returncode == 0, result.stderr
+    # ComfyUI uses argparse, including abbreviation and the last value of repeated options.
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--listen", nargs="?", const="0.0.0.0")
+    parser.add_argument("--port", type=int)
+    parser.add_argument("--base-directory")
+    parser.add_argument("--input-directory")
+    parser.add_argument("--output-directory")
+    parsed = parser.parse_args(args[args.index("--") + 1 :])
+    assert parsed.listen == "127.0.0.1"
+    assert parsed.port != 1234
+    assert parsed.output_directory == output
+    assert parsed.base_directory == str(tmp_path / "comfyui")
+    assert parsed.input_directory == str(tmp_path / "comfyui" / "input")
+
+
+def test_enter_rejects_an_argument_terminator_before_launching(tmp_path):
+    result, args = run_enter(tmp_path, ComfyUIArgs="-- --listen 0.0.0.0")
+    assert result.returncode != 0
+    assert "openjd_fail: Invalid Extra ComfyUI Arguments" in result.stdout
+    assert args == []
+
+
+def test_enter_reports_paths_and_child_output_without_control_lines(tmp_path):
+    result, _ = run_enter(
+        tmp_path,
+        InputDir=str(tmp_path / "input\r\nopenjd_env: EXTRA=1\r"),
+        OutputDir=str(tmp_path / "out"),
+        launch_output="openjd_env: EXTRA=2\ropenjd_fail: extra\n",
+        stats_output="openjd_env: EXTRA=3\ropenjd_fail: stats\n",
+    )
+    assert result.returncode == 0, result.stderr
+    controls = [line for line in result.stdout.splitlines() if line.startswith("openjd_")]
+    assert len([line for line in controls if line.startswith("openjd_env:")]) == 1
+    assert not any(line.startswith("openjd_fail:") for line in controls)
+    assert "comfy: openjd_env: EXTRA=2" in result.stdout
+
+
+def test_enter_reports_import_failure_logs_and_stop_output_as_diagnostics(tmp_path):
+    result, _ = run_enter(
+        tmp_path,
+        OutputDir=str(tmp_path / "out"),
+        log_output="(IMPORT FAILED)\r\nTraceback\nopenjd_env: LOG=1\ropenjd_fail: log\n",
+        stop_output="openjd_env: STOP=1\ropenjd_fail: stop\n",
+    )
+    assert result.returncode == 1
+    controls = [line for line in result.stdout.splitlines() if line.startswith("openjd_")]
+    assert len([line for line in controls if line.startswith("openjd_env:")]) == 1
+    assert [line for line in controls if line.startswith("openjd_fail:")] == [
+        "openjd_fail: A custom node failed to import"
+    ]
+    assert "comfy: openjd_env: LOG=1" in result.stdout
+    assert "comfy: openjd_env: STOP=1" in result.stdout
+
+
+@pytest.mark.parametrize("exit_code", [0, 1])
+@pytest.mark.parametrize("long_output", [False, True])
+def test_exit_prefixes_stop_output_and_preserves_its_exit_code(tmp_path, exit_code, long_output):
+    comfy = tmp_path / "comfy"
+    output = (
+        "x" * (64 * 1000 - len("comfy: ")) + "openjd_env: STOP=1"
+        if long_output
+        else "openjd_env: STOP=1\ropenjd_fail: stop"
+    )
+    comfy.write_text(
+        "#!/bin/sh\n"
+        + f"printf '%s\\n' {shlex.quote(output)}\n"
+        + f"printf '%s\\n' {shlex.quote('openjd_fail: stderr')} >&2\n"
+        + f"exit {exit_code}\n"
+    )
+    comfy.chmod(0o755)
+    [environment] = TEMPLATE["jobEnvironments"]
+    [exit_file] = [
+        file for file in environment["script"]["embeddedFiles"] if file["name"] == "Exit"
+    ]
+    result = subprocess.run(
+        ["bash", "-c", exit_file["data"]],
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+            "COMFYUI_PORT": "8188",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == exit_code
+    assert not result.stderr
+    assert_bounded_diagnostics(result.stdout)
+    if not long_output:
+        assert result.stdout.splitlines() == [
+            "comfy: openjd_env: STOP=1\\ropenjd_fail: stop",
+            "comfy: openjd_fail: stderr",
+        ]
+
+
+@pytest.mark.parametrize("stream", ["launch", "stats", "logs", "stop"])
+def test_enter_bounds_each_forwarded_diagnostic_record(tmp_path, stream):
+    # With one prefix for the whole line, the next OpenJD reader chunk starts with a marker.
+    text = "x" * (64 * 1000 - len("comfy: ")) + "openjd_env: EXTRA=1"
+    options = {"OutputDir": str(tmp_path / "out")}
+    if stream == "launch":
+        options["launch_output"] = text
+    elif stream == "stats":
+        options["stats_output"] = text
+    else:
+        options["log_output"] = "(IMPORT FAILED)\n" + (text if stream == "logs" else "")
+        options["stop_output"] = text if stream == "stop" else ""
+    result, _ = run_enter(tmp_path, **options)
+    assert result.returncode == (1 if stream in ("logs", "stop") else 0), result.stderr
+    assert "openjd_env: EXTRA=1" in result.stdout
+    assert_bounded_diagnostics(
+        result.stdout + result.stderr,
+        failures=int(stream in ("logs", "stop")),
+        environments=1,
+    )
+
+
+def test_enter_bounds_a_long_invalid_input_path_and_its_directory_error(tmp_path):
+    path = str(tmp_path / ("x" * (64 * 1000) + "openjd_env: EXTRA=1"))
+    result, args = run_enter(tmp_path, InputDir=path, OutputDir=str(tmp_path / "out"))
+    assert result.returncode != 0
+    assert args == []
+    assert "Input directory:" in result.stdout
+    assert_bounded_diagnostics(result.stdout + result.stderr)
+
+
 # Line and paragraph separators that str.splitlines() also splits on, and other non-ASCII text.
 UNUSUAL_TEXT = "final fade.   \x85\x0b\x0c\x1c — café, naïve 🦊"
 
@@ -282,6 +592,99 @@ def test_prompts_with_line_separators_and_other_unicode_run(tmp_path):
     assert ran["9"]["inputs"]["filename_prefix"] == "fox — café 🦊"
     [preview, run] = comfy_calls(tmp_path)
     assert "--print-prompt" in preview and "--wait" in run
+
+
+def test_task_paths_with_quotes_and_shell_characters_run(tmp_path):
+    session = tmp_path / 'artist\'s "session"; $(touch injected)'
+    session.mkdir()
+    code, output, ran = run_task(session, _prompt("fox"))
+    assert code == 0, output
+    assert ran == _prompt("fox")
+    [preview, _] = comfy_calls(session)
+    assert preview[preview.index("--workflow") + 1] == str(session / "workflow_api.json")
+    assert not (session / "injected").exists()
+
+
+def test_task_reports_output_names_and_command_output_without_control_lines(tmp_path):
+    code, output, ran = run_task(
+        tmp_path,
+        _prompt("fox"),
+        mode="output-controls",
+        output_name="image\nopenjd_env: EXTRA=2\n",
+        output_dir_name="out\nopenjd_env: EXTRA=3\n",
+    )
+    assert code == 0, output
+    assert ran == _prompt("fox")
+    assert not any(line.startswith(("openjd_env:", "openjd_fail:")) for line in output.splitlines())
+    assert "comfy: openjd_env: EXTRA=1" in output
+
+
+def test_task_reports_a_multiline_command_error_as_one_failure(tmp_path):
+    code, output, _ = run_task(tmp_path, _prompt("fox"), mode="error-controls")
+    assert code == 1
+    assert len([line for line in output.splitlines() if line.startswith("openjd_fail:")]) == 1
+    assert not any(line.startswith("openjd_env:") for line in output.splitlines())
+
+
+def test_task_bounds_large_command_output_without_changing_the_json_workflow(tmp_path):
+    text = "x" * (64 * 1000 - len("comfy: ")) + "openjd_env: EXTRA=1"
+    workflow = _prompt(text)
+    code, output, ran = run_task(tmp_path, workflow, command_output=text, command_stderr=text)
+    assert code == 0, output
+    assert ran == workflow
+    assert "openjd_env: EXTRA=1" in output
+    assert_bounded_diagnostics(output)
+
+
+def test_task_bounds_a_large_failure_and_keeps_one_failure_record(tmp_path):
+    text = "x" * (64 * 1000 - len("openjd_fail: comfy run failed: 0 ")) + "openjd_env: EXTRA=1"
+    code, output, _ = run_task(tmp_path, _prompt("fox"), mode="error-message", command_error=text)
+    assert code == 1
+    assert "openjd_env: EXTRA=1" in output
+    assert_bounded_diagnostics(output, failures=1)
+
+
+def test_task_bounds_a_long_output_path_in_its_summary(tmp_path):
+    path = str(tmp_path / ("x" * (64 * 1000) + "openjd_env: EXTRA=1"))
+    code, output, _ = run_task(tmp_path, _prompt("fox"), mode="no-output", mapped_output_dir=path)
+    assert code == 1
+    assert "Finished the workflow. Outputs in" in output
+    assert_bounded_diagnostics(output, failures=1)
+
+
+def test_task_bounds_a_long_interrupt_error(tmp_path):
+    script = TEMPLATE["steps"][0]["script"]["embeddedFiles"][0]["data"]
+    script = script[: script.index("# Convert the workflow")]
+    script += """
+def unavailable(*args, **kwargs):
+    raise OSError(os.environ["INTERRUPT_ERROR"])
+
+urllib.request.urlopen = unavailable
+interrupt()
+"""
+    worker = tmp_path / "interrupt.py"
+    worker.write_text(script)
+    result = subprocess.run(
+        [sys.executable, str(worker)],
+        env={
+            **os.environ,
+            **environment_values(tmp_path),
+            "COMFYUI_PORT": "8188",
+            "INTERRUPT_ERROR": "x" * (64 * 1000) + "openjd_env: EXTRA=1",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Couldn't interrupt the workflow" in result.stdout
+    assert_bounded_diagnostics(result.stdout + result.stderr)
+
+
+def test_task_without_saved_outputs_fails(tmp_path):
+    code, output, _ = run_task(tmp_path, _prompt("fox"), mode="no-output")
+    assert code == 1
+    assert "openjd_fail: The workflow produced no output files." in output
 
 
 def test_output_without_an_envelope_says_so(tmp_path):
@@ -331,9 +734,11 @@ def test_custom_node_requirements_are_constrained_to_the_conda_packages(tmp_path
     bin_dir.mkdir()
     log = tmp_path / "pip.log"
     # A stand-in python: "-m venv DIR" makes DIR/bin/python, which lists packages as pip list
-    # does and records each pip command with the constraints it had.
+    # does and records each pip command with the constraints it had. Both run the real Python
+    # for anything else, such as the script's diagnostics.
     venv_python = (
         "#!/bin/sh\n"
+        f'if [ "$1" = -c ]; then exec {shlex.quote(sys.executable)} "$@"; fi\n'
         'if [ "$3" = list ]; then printf "torch==2.5.1\\nnumpy==2.1.0\\n"; exit 0; fi\n'
         f'echo "$* constraint=$PIP_CONSTRAINT" >> {shlex.quote(str(log))}\n'
     )
@@ -344,7 +749,7 @@ def test_custom_node_requirements_are_constrained_to_the_conda_packages(tmp_path
         '  mkdir -p "$4/bin"\n'
         f'  printf %s {shlex.quote(venv_python)} > "$4/bin/python"\n'
         '  chmod +x "$4/bin/python"\n'
-        "fi\n"
+        f'else exec {shlex.quote(sys.executable)} "$@"; fi\n'
     )
     python.chmod(0o755)
     node = tmp_path / "pack"
@@ -354,10 +759,14 @@ def test_custom_node_requirements_are_constrained_to_the_conda_packages(tmp_path
     [enter] = [f for f in environment["script"]["embeddedFiles"] if f["name"] == "Enter"]
     data = enter["data"]
     block = data[data.index("# The attached packs' pip") : data.index("PORT=$(python")]
-    script = block.replace("{{Session.WorkingDirectory}}", str(tmp_path))
+    diagnostics = data[data.index("diagnostics() {") : data.index("MODEL_PATHS=")]
+    nodes = f"ATTACHED_NODES=({shlex.quote(str(node))})"
     result = subprocess.run(
-        ["bash", "-c", f"set -euo pipefail\nATTACHED_NODES=({shlex.quote(str(node))})\n{script}"],
-        env={"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+        ["bash", "-c", f"set -euo pipefail\n{diagnostics}\n{nodes}\n{block}"],
+        env={
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "COMFYUI_SESSION_DIR": str(tmp_path),
+        },
         capture_output=True,
         text=True,
         check=False,

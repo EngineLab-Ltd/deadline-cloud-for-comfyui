@@ -185,8 +185,6 @@ const DEFAULT_SETTINGS: Settings = {
   jobAttachmentsFileSystem: "",
 };
 const DONE_STATUSES = new Set(["SUCCEEDED", "FAILED", "CANCELED"]);
-// The most attachments the panel lists. All of them are still attached.
-const MAX_LISTED_ATTACHMENTS = 100;
 
 function readStorage<T>(key: string, fallback: T): T {
   try {
@@ -1908,7 +1906,7 @@ function renderAttachments() {
           h("div", { className: "dl-label" }, "Models the workflow loads, attached automatically"),
           h(
             "ul",
-            { className: "dl-files" },
+            { className: "dl-files", "data-dl-scroll": "models" },
             localModels.map((model) =>
               attachmentItem(
                 model.id,
@@ -1936,21 +1934,16 @@ function renderAttachments() {
     rows.size
       ? h(
           "ul",
-          { className: "dl-files" },
-          [...rows.values()]
-            .slice(0, MAX_LISTED_ATTACHMENTS)
-            .map((row) =>
-              attachmentItem(
-                row.path,
-                row.path,
-                row.kind === "folder" ? "▸ " : "",
-                remove(row),
-                restore(row)
-              )
-            ),
-          rows.size > MAX_LISTED_ATTACHMENTS
-            ? h("li", { className: "dl-muted" }, `and ${rows.size - MAX_LISTED_ATTACHMENTS} more`)
-            : null
+          { className: "dl-files", "data-dl-scroll": "inputs" },
+          [...rows.values()].map((row) =>
+            attachmentItem(
+              row.path,
+              row.path,
+              row.kind === "folder" ? "▸ " : "",
+              remove(row),
+              restore(row)
+            )
+          )
         )
       : h("div", { className: "dl-muted" }, "The workflow loads no input files."),
     h(
@@ -2167,6 +2160,12 @@ function createView(container: HTMLElement, sections: SectionName[]): View {
         }
         // Keep the open/closed state of collapsible sections across re-renders.
         const open = [...slot.querySelectorAll("details")].map((details) => details.open);
+        const scrollPositions = new Map(
+          [...slot.querySelectorAll<HTMLElement>("[data-dl-scroll]")].map((list) => [
+            list.getAttribute("data-dl-scroll"),
+            list.scrollTop,
+          ])
+        );
         const content = RENDERERS[name]();
         slot.replaceChildren(
           ...flatten([content]).filter((child): child is Node | string | number => Boolean(child))
@@ -2176,6 +2175,9 @@ function createView(container: HTMLElement, sections: SectionName[]): View {
           if (index < open.length) {
             details.open = open[index];
           }
+        });
+        slot.querySelectorAll<HTMLElement>("[data-dl-scroll]").forEach((list) => {
+          list.scrollTop = scrollPositions.get(list.getAttribute("data-dl-scroll")) ?? 0;
         });
       }
     },
@@ -2372,7 +2374,8 @@ textarea.dl-input { resize: vertical; }
 .dl-status { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
 .dl-summary strong { font-size: 15px; }
 .dl-files, .dl-jobs { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
-.dl-files li { display: flex; align-items: center; gap: 4px; }
+.dl-files { max-height: 240px; overflow-y: auto; }
+.dl-files li { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
 .dl-removed .dl-path { text-decoration: line-through; color: var(--dl-muted); }
 .dl-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
 .dl-jobs li { border-bottom: 1px solid var(--dl-border); padding-bottom: 4px; }

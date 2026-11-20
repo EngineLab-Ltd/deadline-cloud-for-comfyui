@@ -74,7 +74,6 @@ def comfy(monkeypatch, tmp_path):
     monkeypatch.setattr(routes, "_remove_bundle", lambda bundle_dir: None)
     for var in (
         submit.TEMPLATE_ENV_VAR,
-        submit.ALLOW_REMOTE_ENV_VAR,
         submit.CONDA_CHANNELS_ENV_VAR,
     ):
         monkeypatch.delenv(var, raising=False)
@@ -206,63 +205,209 @@ def test_jobs_rejects_remote_clients(comfy, monkeypatch):
     fake_tools(monkeypatch, comfy.tmp_path)
     status, body = run(post(comfy, {"workflow": WORKFLOW}, remote="10.0.0.5"))
     assert status == 403
-    assert submit.ALLOW_REMOTE_ENV_VAR in body["error"]
-
-
-def test_jobs_allows_remote_clients_when_configured(comfy, monkeypatch):
-    fake_tools(monkeypatch, comfy.tmp_path)
-    monkeypatch.setenv(submit.ALLOW_REMOTE_ENV_VAR, "1")
-    status, _ = run(post(comfy, {"workflow": WORKFLOW}, remote="10.0.0.5"))
-    assert status == 202
+    assert "only accepts requests" in body["error"]
 
 
 @pytest.mark.parametrize(
-    ("remote", "headers", "allow_remote", "status"),
+    ("remote", "headers", "status"),
     [
-        ("127.0.0.1", {}, False, 200),
-        ("::1", {}, False, 200),
-        ("10.0.0.5", {}, False, 403),
-        ("10.0.0.5", {}, True, 200),
+        ("127.0.0.1", {}, 200),
+        ("::1", {}, 200),
+        ("10.0.0.5", {}, 403),
         # A reverse proxy on this machine connects from loopback on behalf of other browsers.
-        ("127.0.0.1", {"X-Forwarded-For": "10.0.0.5"}, False, 403),
-        ("127.0.0.1", {"Forwarded": "for=10.0.0.5"}, False, 403),
-        ("127.0.0.1", {"X-Real-IP": "10.0.0.5"}, False, 403),
-        ("127.0.0.1", {"X-Forwarded-For": "10.0.0.5"}, True, 200),
+        ("127.0.0.1", {"X-Forwarded-For": "10.0.0.5"}, 403),
+        ("127.0.0.1", {"Forwarded": "for=10.0.0.5"}, 403),
+        ("127.0.0.1", {"X-Real-IP": "10.0.0.5"}, 403),
         # Another website's page, in a browser on this machine, when CORS is turned on.
-        ("127.0.0.1", {"Sec-Fetch-Site": "cross-site"}, False, 403),
-        ("127.0.0.1", {"Sec-Fetch-Site": "cross-site"}, True, 403),
-        ("127.0.0.1", {"Sec-Fetch-Site": "same-origin"}, False, 200),
+        ("127.0.0.1", {"Sec-Fetch-Site": "cross-site"}, 403),
+        ("127.0.0.1", {"Sec-Fetch-Site": "same-origin"}, 200),
         # A page on another port of this machine, such as a dev server, is "same-site".
-        ("127.0.0.1", {"Sec-Fetch-Site": "same-site"}, False, 403),
-        ("127.0.0.1", {"Sec-Fetch-Site": "same-site"}, True, 403),
+        ("127.0.0.1", {"Sec-Fetch-Site": "same-site"}, 403),
         # Typed into the address bar or sent by a tool, not by another page.
-        ("127.0.0.1", {"Sec-Fetch-Site": "none"}, False, 200),
-        ("127.0.0.1", {"Host": "localhost:8188"}, False, 200),
-        ("::1", {"Host": "[::1]:8188"}, False, 200),
+        ("127.0.0.1", {"Sec-Fetch-Site": "none"}, 200),
+        ("127.0.0.1", {"Host": "localhost:8188"}, 200),
+        ("::1", {"Host": "[::1]:8188"}, 200),
         # A website that points its own name at 127.0.0.1 (DNS rebinding) is same-origin.
         (
             "127.0.0.1",
             {"Host": "attacker.example:8188", "Sec-Fetch-Site": "same-origin"},
-            False,
             403,
         ),
-        ("127.0.0.1", {"Host": "attacker.example:8188"}, True, 200),
+        ("127.0.0.1", {"Host": "attacker.example:8188"}, 403),
+        ("127.0.0.1", {"Host": "[invalid]:8188"}, 403),
+        ("127.0.0.1", {"Host": "user@localhost:8188"}, 403),
+        ("127.0.0.1", {"Host": "localhost:invalid"}, 403),
+        ("127.0.0.1", {"Host": "localhost:65536"}, 403),
     ],
 )
 @pytest.mark.parametrize("path", ["/deadline/plan", "/deadline/jobs/cancel"])
-def test_routes_only_answer_allowed_browsers(
-    comfy, monkeypatch, path, remote, headers, allow_remote, status
-):
-    if allow_remote:
-        monkeypatch.setenv(submit.ALLOW_REMOTE_ENV_VAR, "1")
+def test_routes_only_answer_allowed_browsers(comfy, path, remote, headers, status):
     body = {"workflow": WORKFLOW, "submissionId": "a" * 32}
     got, response = run(call(comfy, path, body, remote=remote, headers=headers))
     if status == 403:
         assert got == 403
-        assert "websites" in response["error"] or submit.ALLOW_REMOTE_ENV_VAR in response["error"]
+        assert any(text in response["error"] for text in ("websites", "only accepts"))
     else:
         # Cancel answers 404 for a submission that isn't running, past the access check.
         assert got == (200 if path == "/deadline/plan" else 404)
+
+
+@pytest.mark.parametrize(
+    ("origin", "host", "status"),
+    [
+        ("http://localhost:8188", "localhost:8188", 200),
+        ("http://LOCALHOST:8188", "localhost:8188", 200),
+        ("http://localhost", "localhost:80", 200),
+        ("http://[::1]:8188", "[::1]:8188", 200),
+        ("http://attacker.example:8188", "localhost:8188", 403),
+        ("http://localhost:8000", "localhost:8188", 403),
+        ("https://localhost:8188", "localhost:8188", 403),
+        ("http://127.0.0.1:8188", "localhost:8188", 403),
+        ("null", "localhost:8188", 403),
+        ("", "localhost:8188", 403),
+        ("not a URL", "localhost:8188", 403),
+        ("http://[invalid]:8188", "localhost:8188", 403),
+        ("http://localhost:invalid", "localhost:8188", 403),
+        ("http://user@localhost:8188", "localhost:8188", 403),
+        ("http://localhost:8188/path", "localhost:8188", 403),
+        ("http://localhost:8188?query=value", "localhost:8188", 403),
+        ("http://localhost:8188#fragment", "localhost:8188", 403),
+        ("http://localhost:8188 http://attacker.example", "localhost:8188", 403),
+    ],
+)
+@pytest.mark.parametrize("fetch_site", [None, "same-origin", "none"])
+@pytest.mark.parametrize("path", ["/deadline/plan", "/deadline/jobs/cancel"])
+def test_routes_check_origin_even_without_fetch_metadata(
+    comfy, path, origin, host, status, fetch_site
+):
+    headers = {"Host": host, "Origin": origin}
+    if fetch_site is not None:
+        headers["Sec-Fetch-Site"] = fetch_site
+    got, response = run(
+        call(comfy, path, {"workflow": WORKFLOW, "submissionId": "a" * 32}, headers=headers)
+    )
+    if status == 403:
+        assert got == 403
+        assert "websites" in response["error"]
+    else:
+        assert got == (200 if path == "/deadline/plan" else 404)
+
+
+@pytest.mark.parametrize("fetch_site", [None, "same-origin", "none"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/deadline/plan",
+        "/deadline/bundle",
+        "/deadline/jobs",
+        "/deadline/jobs/confirm",
+        "/deadline/jobs/cancel",
+        "/deadline/jobs/download",
+        "/deadline/cloud/farms",
+        "/deadline/choose",
+    ],
+)
+def test_routes_reject_other_origins_with_a_local_host(comfy, path, fetch_site):
+    # A local proxy can rewrite Host and omit forwarding headers while preserving Origin.
+    headers = {"Host": "127.0.0.1:8188", "Origin": "http://other.example"}
+    if fetch_site is not None:
+        headers["Sec-Fetch-Site"] = fetch_site
+    status, response = run(
+        call(
+            comfy,
+            path,
+            {"workflow": WORKFLOW, "submissionId": "a" * 32},
+            remote="127.0.0.1",
+            headers=headers,
+        )
+    )
+    assert status == 403
+    assert "websites" in response["error"]
+
+
+def test_routes_reject_multiple_origins(comfy):
+    status, response = run(
+        call(
+            comfy,
+            "/deadline/plan",
+            {"workflow": WORKFLOW},
+            headers=[
+                ("Host", "localhost:8188"),
+                ("Origin", "http://localhost:8188"),
+                ("Origin", "http://attacker.example"),
+            ],
+        )
+    )
+    assert status == 403
+    assert "websites" in response["error"]
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        ("same-origin", "cross-site"),
+        ("cross-site", "same-origin"),
+        ("none", "same-origin"),
+        ("same-origin", "same-origin"),
+    ],
+)
+def test_routes_reject_duplicate_fetch_metadata(comfy, values):
+    status, response = run(
+        call(
+            comfy,
+            "/deadline/plan",
+            {"workflow": WORKFLOW},
+            headers=[("Sec-Fetch-Site", value) for value in values],
+        )
+    )
+    assert status == 403
+    assert "websites" in response["error"]
+
+
+@pytest.mark.parametrize(
+    ("host", "target_host", "status"),
+    [
+        ("localhost:8188", "localhost:8188", 200),
+        ("LOCALHOST:8188", "localhost:8188", 200),
+        ("other.example:8188", "localhost:8188", 403),
+        ("localhost:8188", "other.example:8188", 403),
+        ("localhost:8188", "127.0.0.1:8188", 403),
+        ("user@localhost:8188", "localhost:8188", 403),
+        (None, "localhost:8188", 403),
+    ],
+)
+def test_routes_validate_host_with_an_absolute_request_target(comfy, host, target_host, status):
+    """The URL's authority cannot hide a different or malformed Host header."""
+
+    async def request():
+        app = web.Application()
+        app.add_routes(comfy.server.routes)
+        async with TestServer(app) as server:
+            reader, writer = await asyncio.open_connection(server.host, server.port)
+            body = json.dumps({"workflow": WORKFLOW}).encode()
+            version = "1.0" if host is None else "1.1"
+            host_header = "" if host is None else f"Host: {host}\r\n"
+            headers = (
+                f"POST http://{target_host}/deadline/plan HTTP/{version}\r\n"
+                f"{host_header}"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode()
+            try:
+                writer.write(headers + body)
+                await writer.drain()
+                response = await asyncio.wait_for(reader.read(), 5)
+            finally:
+                writer.close()
+                await writer.wait_closed()
+            header_block, _, response_body = response.partition(b"\r\n\r\n")
+            return int(header_block.split()[1]), json.loads(response_body)
+
+    got, response = run(request())
+    assert got == status
+    if status == 403:
+        assert "only accepts requests addressed" in response["error"]
 
 
 def test_jobs_requires_json(comfy, monkeypatch):

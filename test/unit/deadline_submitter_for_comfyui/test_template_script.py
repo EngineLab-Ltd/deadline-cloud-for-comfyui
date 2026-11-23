@@ -728,17 +728,30 @@ def test_a_workflow_past_its_timeout_is_interrupted(tmp_path):
     assert interrupts == ["/interrupt"]
 
 
-def test_custom_node_requirements_are_constrained_to_the_conda_packages(tmp_path):
-    """Packages conda installed, such as torch, are pinned too, so a pack can't replace them."""
+def _environment_file(name: str) -> str:
+    [environment] = TEMPLATE["jobEnvironments"]
+    [file] = [f for f in environment["script"]["embeddedFiles"] if f["name"] == name]
+    return file["data"]
+
+
+def _run_node_requirements(
+    tmp_path: Path, requirements: str
+) -> tuple[subprocess.CompletedProcess, list[str]]:
+    """
+    Runs the Enter script's custom node requirements block for one pack, and returns its result
+    and the pip commands it ran.
+    """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     log = tmp_path / "pip.log"
+    log.touch()
     # A stand-in python: "-m venv DIR" makes DIR/bin/python, which lists packages as pip list
     # does and records each pip command with the constraints it had. Both run the real Python
-    # for anything else, such as the script's diagnostics.
+    # for anything else, such as the script's diagnostics and the requirements check.
+    real_python = shlex.quote(sys.executable)
     venv_python = (
         "#!/bin/sh\n"
-        f'if [ "$1" = -c ]; then exec {shlex.quote(sys.executable)} "$@"; fi\n'
+        f'case "$1" in -c|*.py) exec {real_python} "$@";; esac\n'
         'if [ "$3" = list ]; then printf "torch==2.5.1\\nnumpy==2.1.0\\n"; exit 0; fi\n'
         f'echo "$* constraint=$PIP_CONSTRAINT" >> {shlex.quote(str(log))}\n'
     )
@@ -749,20 +762,21 @@ def test_custom_node_requirements_are_constrained_to_the_conda_packages(tmp_path
         '  mkdir -p "$4/bin"\n'
         f'  printf %s {shlex.quote(venv_python)} > "$4/bin/python"\n'
         '  chmod +x "$4/bin/python"\n'
-        f'else exec {shlex.quote(sys.executable)} "$@"; fi\n'
+        f'else exec {real_python} "$@"; fi\n'
     )
     python.chmod(0o755)
     node = tmp_path / "pack"
     node.mkdir()
-    (node / "requirements.txt").write_text("torch>=99\n")
-    [environment] = TEMPLATE["jobEnvironments"]
-    [enter] = [f for f in environment["script"]["embeddedFiles"] if f["name"] == "Enter"]
-    data = enter["data"]
+    (node / "requirements.txt").write_text(requirements)
+    check = tmp_path / "check-requirements.py"
+    check.write_text(_environment_file("CheckRequirements"))
+    data = _environment_file("Enter")
     block = data[data.index("# The attached packs' pip") : data.index("PORT=$(python")]
     diagnostics = data[data.index("diagnostics() {") : data.index("MODEL_PATHS=")]
     nodes = f"ATTACHED_NODES=({shlex.quote(str(node))})"
     result = subprocess.run(
-        ["bash", "-c", f"set -euo pipefail\n{diagnostics}\n{nodes}\n{block}"],
+        # The Enter script gets the requirements check as its first argument.
+        ["bash", "-c", f"set -euo pipefail\n{diagnostics}\n{nodes}\n{block}", "enter", str(check)],
         env={
             "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
             "COMFYUI_SESSION_DIR": str(tmp_path),
@@ -771,10 +785,97 @@ def test_custom_node_requirements_are_constrained_to_the_conda_packages(tmp_path
         text=True,
         check=False,
     )
+    return result, log.read_text().splitlines()
+
+
+def test_custom_node_requirements_are_constrained_to_the_conda_packages(tmp_path):
+    """Packages conda installed, such as torch, are pinned too, so a pack can't replace them."""
+    result, pip = _run_node_requirements(tmp_path, "torch>=99\n")
     assert result.returncode == 0, result.stdout + result.stderr
     constraints = tmp_path / "constraints.txt"
     assert constraints.read_text() == "torch==2.5.1\nnumpy==2.1.0\n"
-    assert log.read_text().splitlines() == [
-        f"-m pip install -r {node / 'requirements.txt'} constraint={constraints}",
+    requirements = tmp_path / "pack" / "requirements.txt"
+    assert pip == [
+        f"-m pip install -r {requirements} constraint={constraints}",
         f"-m pip check constraint={constraints}",
     ]
+
+
+def test_a_pack_cant_point_pip_at_another_package_index(tmp_path):
+    """The worker runs pip with the queue role's credentials."""
+    result, pip = _run_node_requirements(
+        tmp_path, "numpy>=1.26\n--extra-index-url https://packages.example.com/simple\n"
+    )
+    assert result.returncode == 1
+    assert pip == []
+    lines = result.stdout.splitlines()
+    assert (
+        "comfy: Line 2, '--extra-index-url https://packages.example.com/simple': it's a pip option"
+        in lines
+    )
+    assert lines[-1] == (
+        "openjd_fail: The requirements of pack use pip options, paths or URLs that jobs don't "
+        "install"
+    )
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "numpy>=1.26  # pinned for the sampler",
+        "# a comment",
+        'opencv-python-headless; sys_platform == "linux"',
+        "segment-anything @ git+https://github.com/facebookresearch/segment-anything.git",
+        "torchvision==0.20.1 --hash=sha256:0123abcd",
+        "https://files.example.com/pkg-1.0-py3-none-any.whl",
+    ],
+)
+def test_requirements_check_accepts_packages_and_https_urls(tmp_path, line):
+    (tmp_path / "requirements.txt").write_text(line + "\n")
+    (tmp_path / "check.py").write_text(_environment_file("CheckRequirements"))
+    result = subprocess.run(
+        [sys.executable, str(tmp_path / "check.py"), str(tmp_path / "requirements.txt")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert (result.returncode, result.stdout) == (0, "")
+
+
+@pytest.mark.parametrize(
+    ("line", "reason"),
+    [
+        ("--extra-index-url https://packages.example.com/simple", "it's a pip option"),
+        ("-i https://packages.example.com/simple", "it's a pip option"),
+        ("--index-url=https://packages.example.com/simple", "it's a pip option"),
+        ("--trusted-host packages.example.com", "it's a pip option"),
+        ("--find-links https://packages.example.com/", "it's a pip option"),
+        ("-r other.txt", "it's a pip option"),
+        ("-c constraints.txt", "it's a pip option"),
+        ("-e .", "it's a pip option"),
+        ("numpy --index-url https://packages.example.com/simple", "it has a pip option"),
+        ("numpy \\\n  --extra-index-url https://packages.example.com/", "it has a pip option"),
+        ("pkg @ https://${AWS_SECRET_ACCESS_KEY}@packages.example.com/x", "environment variable"),
+        ("pkg @ http://packages.example.com/pkg.whl", "only https URLs are installed"),
+        ("git+ssh://git@example.com/pack.git", "only https URLs are installed"),
+        ("pkg @ file:///tmp/pkg", "only https URLs are installed"),
+        ("./vendor/pkg", "it's a local path"),
+        ("~/pkg", "it's a local path"),
+        ("C:\\pkgs\\pkg.whl", "it's a local path"),
+    ],
+)
+def test_requirements_check_refuses_what_could_change_where_pip_installs_from(
+    tmp_path, line, reason
+):
+    (tmp_path / "requirements.txt").write_text("numpy\n" + line + "\n")
+    (tmp_path / "check.py").write_text(_environment_file("CheckRequirements"))
+    result = subprocess.run(
+        [sys.executable, str(tmp_path / "check.py"), str(tmp_path / "requirements.txt")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    [message] = result.stdout.splitlines()
+    assert message.startswith("Line 2, ")
+    assert reason in message

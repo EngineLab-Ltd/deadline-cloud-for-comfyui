@@ -183,6 +183,11 @@ attachments, uploaded from this machine:
   on this machine, the panel warns about it. The job fails with the import error when a custom
   node doesn't load.
 
+  A pack's `requirements.txt` can list packages and `https` URLs, such as `git+https`. The job
+  fails before installing anything when the file has a pip option, such as `--extra-index-url` or
+  `-r`, a local path, an environment variable or another kind of URL. pip still uses the package
+  index the workers are set up with, such as through `PIP_INDEX_URL` in a queue environment.
+
   Anyone who can use the queue can read a job's attachments. Staging leaves out files named like
   credential stores, such as `.env`, `*.pem`, `.npmrc`, `hf_token` and `service_account.json`,
   and links that point outside the pack. A pack can still keep a key somewhere else, such as in

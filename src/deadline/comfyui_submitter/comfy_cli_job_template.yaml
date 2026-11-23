@@ -170,7 +170,7 @@ jobEnvironments:
     actions:
       onEnter:
         command: bash
-        args: ['{{Env.File.Enter}}']
+        args: ['{{Env.File.Enter}}', '{{Env.File.CheckRequirements}}']
         timeout: 7200
       onExit:
         command: bash
@@ -284,6 +284,10 @@ jobEnvironments:
                     # A folder name can hold line breaks, which would start a new OpenJD line.
                     NAME="${NODE_DIR##*/}"
                     NAME="${NAME//[$'\r\n']/ }"
+                    # A pack's requirements.txt can't choose where pip installs from. $1 is the
+                    # CheckRequirements script.
+                    "$VENV/bin/python" "$1" "$NODE_DIR/requirements.txt" 2>&1 | diagnostics \
+                        || { echo "openjd_fail: The requirements of $NAME use pip options, paths or URLs that jobs don't install"; exit 1; }
                     echo "openjd_status: Installing the requirements of $NAME"
                     "$VENV/bin/python" -m pip install -r "$NODE_DIR/requirements.txt" 2>&1 | diagnostics \
                         || { echo "openjd_fail: Couldn't install the requirements of $NAME"; exit 1; }
@@ -359,6 +363,52 @@ jobEnvironments:
         done
         echo "openjd_fail: The ComfyUI server didn't start within ${COMFYUI_SERVER_START_TIMEOUT}s"
         exit 1
+    - name: CheckRequirements
+      filename: check-requirements.py
+      type: TEXT
+      data: |
+        """
+        Checks a custom node pack's requirements.txt before pip installs it. pip also reads options
+        from the file, such as --index-url, --extra-index-url and --trusted-host, as well as nested
+        files, editable installs, local paths and URLs, and it expands environment variables in
+        them. The worker runs pip with the queue role's credentials, so a pack can't point it at
+        another package index. Package names and https URLs, such as git+https, are installed.
+        Prints each line that isn't, and exits with 1.
+        """
+        import re
+        import sys
+
+        ALLOWED_SCHEMES = {"https", "git+https"}
+
+        with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+            # pip joins a line that ends with a backslash to the next one.
+            text = re.sub(r"\\\r?\n", "", f.read())
+        refused = []
+        # pip splits the file with splitlines().
+        for number, line in enumerate(text.splitlines(), start=1):
+            requirement = re.sub(r"(^|\s)#.*", "", line).strip()
+            if not requirement:
+                continue
+            words = requirement.split()
+            schemes = {
+                scheme.lower() for scheme in re.findall(r"([A-Za-z][A-Za-z0-9+.-]*)://", requirement)
+            }
+            if requirement.startswith("-"):
+                reason = "it's a pip option"
+            elif any(word.startswith("-") and not word.startswith("--hash") for word in words[1:]):
+                reason = "it has a pip option"
+            elif "${" in requirement:
+                reason = "it reads an environment variable"
+            elif schemes - ALLOWED_SCHEMES:
+                reason = "only https URLs are installed"
+            elif re.match(r"[./~\\]|file:|[A-Za-z]:[/\\]", requirement):
+                reason = "it's a local path"
+            else:
+                continue
+            refused.append(f"Line {number}, {requirement!r}: {reason}")
+        for message in refused:
+            print(message)
+        sys.exit(1 if refused else 0)
     - name: Exit
       filename: exit-comfyui-server.sh
       type: TEXT

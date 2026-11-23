@@ -481,7 +481,8 @@ def test_create_job_bundle_writes_scripts_as_literal_blocks(tmp_path):
         submit.JOB_TEMPLATE, API_WORKFLOW, "w", tmp_path, description="Rewritten"
     )
     text = (bundle_dir / "template.yaml").read_text()
-    assert text.count("data: |\n") == 3
+    # Enter, CheckRequirements, Exit and the task's Run script.
+    assert text.count("data: |\n") == 4
     assert "\\nimport json" not in text
 
 

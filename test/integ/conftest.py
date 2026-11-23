@@ -1,12 +1,12 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 """
-Shared fixtures for the Playwright e2e tests, which run the panel in a real ComfyUI.
+Shared fixtures for the Playwright integration tests, which run the panel in a real ComfyUI.
 
 Set COMFYUI_PATH to a ComfyUI checkout that has its requirements installed, and the fixture
 launches it with this extension loaded, the way `install_submitter.py --link` would. Without
 COMFYUI_PATH every test skips, so `hatch run test` and the shared CI stay hermetic. COMFYUI_PYTHON
 overrides the interpreter that launches ComfyUI; by default one is looked for inside the checkout.
-The panel is compiled first when needed (`npm ci` and `npm run build` in frontend/), and the e2e
+The panel is compiled first when needed (`npm ci` and `npm run build` in frontend/), and the integ
 hatch environment downloads Playwright's Chromium.
 
 The ComfyUI server gets fake Deadline Cloud tools, like the unit tests', so the extension's
@@ -112,7 +112,7 @@ def _build_panel() -> None:
         return
     npm = shutil.which("npm")
     if npm is None:
-        pytest.skip("Node.js and npm are needed to build the panel for the e2e tests.")
+        pytest.skip("Node.js and npm are needed to build the panel for the integration tests.")
     frontend = REPO_ROOT / "frontend"
     if not (frontend / "node_modules").is_dir():
         subprocess.run([npm, "ci"], cwd=frontend, check=True)
@@ -152,7 +152,7 @@ def _fake_tools(directory: Path) -> dict[str, str]:
     ComfyUI server process. The fake CLI answers --version, and the fake Python stands in for
     bridge.py: every command the routes run gets a logged-in account, a farm and queue to submit
     to, and submitting answers with a job ID. Returns the environment variables that point the
-    server at them. The fakes are POSIX shell scripts, so Windows runs without them.
+    server at them. The fakes are POSIX shell scripts, so the tests skip themselves on Windows.
     """
     responses = {
         "status": {
@@ -191,14 +191,14 @@ def _fake_tools(directory: Path) -> dict[str, str]:
 
 @pytest.fixture(scope="session")
 def comfy(tmp_path_factory: pytest.TempPathFactory) -> Iterator[ComfyUI]:
-    """A ComfyUI server with this extension loaded, shared by the whole e2e run."""
+    """A ComfyUI server with this extension loaded, shared by the whole integration run."""
     checkout = _checkout()
     if checkout is None:
-        pytest.skip("Set COMFYUI_PATH to a ComfyUI checkout to run the e2e tests.")
+        pytest.skip("Set COMFYUI_PATH to a ComfyUI checkout to run the integration tests.")
     python = _python(checkout)
     if python is None:
         pytest.skip(
-            "ComfyUI's requirements aren't installed where the e2e tests can find them. Install "
+            "ComfyUI's requirements aren't installed where the integration tests can find them. Install "
             "them into a venv in the ComfyUI checkout, or set COMFYUI_PYTHON."
         )
     _build_panel()
@@ -225,7 +225,7 @@ def comfy(tmp_path_factory: pytest.TempPathFactory) -> Iterator[ComfyUI]:
         "--disable-auto-launch",
     ]
     log = work / "comfyui.log"
-    fake_tools = {} if sys.platform == "win32" else _fake_tools(work)
+    fake_tools = _fake_tools(work)
     with log.open("w", encoding="utf-8") as log_file:
         process = subprocess.Popen(
             command,

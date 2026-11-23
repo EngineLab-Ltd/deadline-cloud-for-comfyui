@@ -18,16 +18,16 @@ lint = [
   "typing",
 ]
 
-[envs.e2e]
+[envs.integ]
 pre-install-commands = [
   "pip install -r requirements-testing.txt",
-  "pip install -r requirements-e2e-testing.txt",
+  "pip install -r requirements-integ-testing.txt",
   "python -m playwright install chromium"
 ]
 
-[envs.e2e.scripts]
-sync = "pip install -r requirements-e2e-testing.txt"
-test = "pytest --no-cov {args:test/e2e} -vvv"
+[envs.integ.scripts]
+sync = "pip install -r requirements-integ-testing.txt"
+test = "pytest --no-cov {args:test/integ} -vvv"
 
 [[envs.all.matrix]]
 python = ["3.13", "3.14"]

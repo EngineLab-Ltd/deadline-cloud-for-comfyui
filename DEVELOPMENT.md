@@ -38,7 +38,7 @@ npm ci
 | `hatch run fmt` | Format with black, then run ruff. |
 | `hatch build` | Build the sdist and the wheel into `dist/`. |
 | `hatch version` | Print the version that hatch-vcs derives from git. |
-| `hatch run e2e:test` | Run the e2e tests, which drive the panel in the ComfyUI that `COMFYUI_PATH` names. |
+| `hatch run integ:test` | Run the integration tests, which drive the panel in the ComfyUI that `COMFYUI_PATH` names. |
 | `npm run build` | In `frontend/`: type-check the TypeScript and compile it into `src/deadline/comfyui_submitter/web/`. |
 | `npm run check` | In `frontend/`: type-check only. |
 
@@ -89,9 +89,9 @@ To run a bridge command by hand, with the CLI's Python:
 echo '{}' | /path/to/deadline-cli-python -I src/deadline/comfyui_submitter/bridge.py status
 ```
 
-## End-to-end tests
+## Integration tests
 
-The e2e tests in `test/e2e` drive the panel's compiled JavaScript in a real ComfyUI with
+The integration tests in `test/integ` drive the panel's compiled JavaScript in a real ComfyUI with
 [Playwright](https://playwright.dev/python/). Each test case lives in its own `test_scripts`
 subdirectory with the workflow file it runs, the values it changes in the UI, and the expected
 job bundle. The Deadline Cloud tools are faked for the ComfyUI server, so no credentials are
@@ -104,11 +104,11 @@ Tests need a ComfyUI checkout with its requirements installed:
 ```
 python -m venv /path/to/ComfyUI/.venv
 /path/to/ComfyUI/.venv/bin/python -m pip install -r /path/to/ComfyUI/requirements.txt
-COMFYUI_PATH=/path/to/ComfyUI hatch run e2e:test
+COMFYUI_PATH=/path/to/ComfyUI hatch run integ:test
 ```
 
 The panel is compiled first when needed (`npm ci` and `npm run build` in `frontend/`), and
 ComfyUI is started with this checkout linked in as its only custom node, a fresh base directory
 and a free port. Without `COMFYUI_PATH` the tests skip, so `hatch run test` stays hermetic;
 `COMFYUI_PYTHON` picks the interpreter that launches ComfyUI when it isn't the default. The
-e2e hatch environment downloads Playwright's Chromium when it's created.
+integ hatch environment downloads Playwright's Chromium when it's created.

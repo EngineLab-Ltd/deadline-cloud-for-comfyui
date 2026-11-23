@@ -638,6 +638,12 @@ def plan_task_lists(
     return plan
 
 
+# OpenJD refuses Unicode's control characters in a label, and all but line breaks and tabs in a
+# description. A list item, a folder name or a file name can hold one.
+_LABEL_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_DESCRIPTION_CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
 def _item_parameters(source: ItemSource) -> dict[str, Any]:
     """The job parameter that holds the range of a source's items to run."""
     shown = []
@@ -658,11 +664,11 @@ def _item_parameters(source: ItemSource) -> dict[str, Any]:
         "type": "STRING",
         "userInterface": {
             "control": "LINE_EDIT",
-            "label": source.label[:64],
+            "label": _LABEL_CONTROL_CHARACTERS.sub(" ", source.label)[:64],
             "groupLabel": TASKS_GROUP,
         },
         "default": source.range,
-        "description": description[:2048],
+        "description": _DESCRIPTION_CONTROL_CHARACTERS.sub(" ", description)[:2048],
     }
 
 

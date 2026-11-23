@@ -803,6 +803,22 @@ def test_add_task_lists_shortens_long_item_lists():
     assert parameter["description"].endswith("10: " + "9" * 60 + "...; and 2 more.")
 
 
+def test_add_task_lists_leaves_out_control_characters_openjd_refuses():
+    """A folder name or a list item can hold one, which would make the template invalid."""
+    source = submit.ItemSource(
+        "Folder5", "Folder shots\x07a (#5)", 2, "folder", ["a\x01b.png", "line\nbreak\ttab\x9f"]
+    )
+    template = {
+        "specificationVersion": "jobtemplate-2023-09",
+        "name": "fox",
+        "steps": [{"name": "Run", "script": {"actions": {"onRun": {"command": "true"}}}}],
+    }
+    parameter = submit.add_task_lists(template, [source])["parameterDefinitions"][0]
+    assert parameter["userInterface"]["label"] == "Folder shots a (#5)"
+    assert parameter["description"].endswith("Items: 1: a b.png; 2: line\nbreak\ttab .")
+    decode_job_template(template=submit.add_task_lists(template, [source]))
+
+
 def test_add_task_lists_lists_ten_items_in_full():
     source = submit.ItemSource(
         "Folder5", "Folder cats (#5)", 10, "folder", [str(n) for n in range(10)]

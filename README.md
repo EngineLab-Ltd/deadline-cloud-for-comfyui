@@ -179,7 +179,9 @@ attachments, uploaded from this machine:
   Directory**, without its `.git`, `__pycache__` or virtual environment folders. A single-file
   custom node is attached as its one `.py` file. On the worker, ComfyUI loads the packs from where
   they're mapped, and the job installs each pack's `requirements.txt` into a virtual environment
-  layered on the conda environment, which they can't change. When a pack's files can't be found
+  layered on the conda environment. pip can't replace the conda environment's packages, such as
+  `torch`, but a pack's own code, and any package pip builds from source, runs as the job's user
+  and can write wherever that user can. When a pack's files can't be found
   on this machine, the panel warns about it. The job fails with the import error when a custom
   node doesn't load.
 

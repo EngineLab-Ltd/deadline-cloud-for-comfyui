@@ -89,7 +89,8 @@ parameterDefinitions:
   description: >
     Load the custom node packs attached under Custom Nodes Directory on the worker, and
     install their Python dependencies into a session virtual environment layered on the
-    conda environment, which they can't change. Turn off when the workers already provide
+    conda environment. pip can't replace the conda environment's packages, but a pack's
+    code runs as the job's user. Turn off when the workers already provide
     every custom node and its dependencies, for example from a custom nodes conda package;
     Custom Nodes Directory is then ignored.
 - name: CustomNodesDirectory
@@ -236,6 +237,10 @@ jobEnvironments:
                 fi
             done
         fi
+        if [ ${#ATTACHED_NODES[@]} -gt 0 ]; then
+            python -c 'import os, sys; print("Attached custom nodes: " + ", ".join(repr(os.path.basename(path)) for path in sys.argv[1:]))' \
+                "${ATTACHED_NODES[@]}" 2>&1 | diagnostics
+        fi
         # ComfyUI can't read an empty extra model paths file, so it's only passed with entries.
         MODEL_PATH_FILES=()
         if [ -s "$MODEL_PATHS" ]; then
@@ -265,9 +270,10 @@ jobEnvironments:
             2>&1 | diagnostics
 
         # The attached packs' pip dependencies go into a virtual environment layered on the conda
-        # environment, which comfy launch uses because VIRTUAL_ENV is set, constrained so they
-        # can't change packages such as torch. AttachCustomNodes off skips this: the workers
-        # provide the custom nodes.
+        # environment, which comfy launch uses because VIRTUAL_ENV is set. The constraints keep
+        # pip from replacing the conda environment's packages, such as torch. They don't limit
+        # what a pack's code, or a package pip builds from source, does as the job's user.
+        # AttachCustomNodes off skips this: the workers provide the custom nodes.
         if [ ${#ATTACHED_NODES[@]} -gt 0 ]; then
             VENV="$COMFYUI_SESSION_DIR/node-venv"
             python -m venv --system-site-packages "$VENV" 2>&1 | diagnostics \

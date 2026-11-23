@@ -75,7 +75,8 @@ a running ComfyUI, so test them by hand:
    template's.
 7. Submit a workflow that uses a custom node installed on this machine, to a worker that doesn't
    have it. Check that the job log lists it under `Attached custom nodes` and that the job
-   succeeds.
+   succeeds. Then remove the pack with its **✕** under **Attachments**, submit again, and check
+   that the job fails on the missing node.
 
 To exercise the routes without the frontend:
 

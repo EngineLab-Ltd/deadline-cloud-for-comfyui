@@ -246,6 +246,27 @@ def test_model_paths_leave_out_attached_custom_nodes_when_attaching_is_off(tmp_p
     assert write_model_paths(tmp_path, custom_nodes_directory=attached, attach_nodes=False) is None
 
 
+def test_the_job_log_lists_the_attached_custom_nodes(tmp_path):
+    """The names come from the bundle, so they're written as diagnostics, not OpenJD commands."""
+    attached = tmp_path / "attached nodes"
+    (attached / "studio-nodes").mkdir(parents=True)
+    (attached / "openjd_fail: x").mkdir()
+    result = subprocess.run(
+        ["bash", "-c", "set -euo pipefail\n" + enter_script("# ComfyUI can't read an empty")],
+        env={
+            "PATH": os.environ["PATH"],
+            **environment_values(tmp_path, CustomNodesDirectory=str(attached)),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "comfy: Attached custom nodes: 'openjd_fail: x', 'studio-nodes'"
+    ]
+
+
 def model_path_args(
     tmp_path: Path,
     extra: str = "",

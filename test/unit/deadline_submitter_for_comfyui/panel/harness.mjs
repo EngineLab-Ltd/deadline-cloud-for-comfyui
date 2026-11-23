@@ -284,6 +284,27 @@ if (scenario === "answer-confirmation") {
   view.render(["attachments"]);
   result.inputScrollAfterModelsDisappear = list("inputs").scrollTop;
   result.attachmentsStillOpen = container.querySelectorAll("details")[0].open;
+  // A custom node pack is removed and added back like a model, and the status warns about it.
+  const text = (node) =>
+    node.children.map((child) => (child instanceof NodeStub ? text(child) : String(child))).join("");
+  const pack = "/custom_nodes/studio-nodes";
+  const localNodes = [{ name: "studio-nodes", path: pack, size: 3_200_000_000, files: 12_500, counted: true }];
+  api.handlers["/deadline/plan"] = async (body) => ({ ...planFor(body), localNodes });
+  await ui.loadPlan(true);
+  view.render(["attachments"]);
+  result.packRow = text(rows().find((row) => row.attributes.title === pack));
+  result.largePackStatus = text(ui.__renderers.status());
+  click(pack);
+  result.packRowRemoved = rows().find((row) => row.attributes.title === pack).className;
+  result.packStatus = text(ui.__renderers.status());
+  state.submission = null;
+  await ui.submit();
+  result.excludedNodes = api.calls.filter(({ path }) => path === "/deadline/jobs").at(-1).body.excludedNodes;
+  state.submission = null;
+  click(pack);
+  result.packStatusAfterRestoring = text(ui.__renderers.status());
+  await ui.submit();
+  result.excludedNodesAfterRestoring = api.calls.filter(({ path }) => path === "/deadline/jobs").at(-1).body.excludedNodes;
 } else if (scenario === "same-name-models") {
   // A checkpoint and a LoRA share a file name. Removing one leaves the other attached.
   const model = (directory) => ({
@@ -379,6 +400,15 @@ if (scenario === "answer-confirmation") {
   const message = "Downloaded 2 files";
   api.emit("deadline.download", { jobId: "job-1", status: "DOWNLOADED", message, fileCount: 2, directory });
   result.toasts = app.toasts.map(({ detail }) => detail);
+}
+if (scenario === "parse-bool") {
+  // The panel reads a BOOL parameter as OpenJD and the submitter do.
+  result.values = [
+    ...[true, "true", "Yes", "ON", "1", 1],
+    ...[false, "FALSE", "no", "off", "0", 0],
+    // OpenJD refuses spaces around a BOOL.
+    ...["", "garbage", 2, " true", "off "],
+  ].map(ui.parseBool);
 }
 console.log(JSON.stringify(result));
 process.exit(0);

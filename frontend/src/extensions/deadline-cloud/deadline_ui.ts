@@ -72,6 +72,16 @@ interface HostRequirements {
 }
 
 // What /deadline/plan returns for the workflow.
+// A custom node pack the job attaches, and its size and file count. counted is false when the
+// pack had more files than the server counts.
+interface LocalNode {
+  name: string;
+  path: string;
+  size?: number;
+  files?: number;
+  counted?: boolean;
+}
+
 interface Plan {
   name: string;
   template: string;
@@ -83,7 +93,9 @@ interface Plan {
   // id is the model's folder and name, such as checkpoints/sd.safetensors. Two models can share a
   // name in different folders.
   localModels?: { id: string; name: string; directory: string | null; path: string }[];
+  localNodes?: LocalNode[];
   warnings?: string[];
+  nodeWarnings?: string[];
 }
 
 interface Submission {
@@ -172,6 +184,7 @@ const TOOLTIP_GAP = 6;
 const TOOLTIP_MARGIN = 8;
 // The submitter fills these in when it creates the job bundle.
 const AUTOMATIC_PARAMETERS = new Set(["WorkflowFile"]);
+const ATTACH_NODES_PARAMETER = "AttachCustomNodes";
 const DEFAULT_SETTINGS: Settings = {
   requirePathsExist: false,
   priority: 50,
@@ -575,6 +588,26 @@ function parameterValue(parameter: Parameter): ParameterValue {
   return filled ?? parameter.default ?? "";
 }
 
+// A BOOL job parameter's value as OpenJD reads it, or null when OpenJD would refuse it. The
+// submitter reads it the same way.
+export function parseBool(value: ParameterValue): boolean | null {
+  // OpenJD refuses a value with spaces around it, such as " true".
+  const text = String(value).toLowerCase();
+  if (["true", "yes", "on", "1"].includes(text)) {
+    return true;
+  }
+  if (["false", "no", "off", "0"].includes(text)) {
+    return false;
+  }
+  return null;
+}
+
+// Templates without the switch don't list any custom nodes.
+function attachesNodes() {
+  const parameter = state.plan?.parameters.find(({ name }) => name === ATTACH_NODES_PARAMETER);
+  return !parameter || parseBool(parameterValue(parameter)) !== false;
+}
+
 // What a queue parameter is without the artist's edit: the submitter's configured value, then the
 // job template's value when the template defines the same parameter, which the job sends in its
 // place, such as Conda Packages' comfy, then the queue environment's default.
@@ -671,6 +704,7 @@ function bundleRequest() {
     hostRequirements: state.hostForm ? requirementsFromForm(state.hostForm) : undefined,
     attachments: attachments(),
     excludedModels: excludedModels(),
+    excludedNodes: excludedNodes(),
   };
 }
 
@@ -1168,8 +1202,12 @@ function renderStatus() {
         h("span", { className: "dl-muted" }, ` · ${plan.template}`)
       )
     );
+    // With Attach Custom Nodes off, the workers provide the custom nodes.
+    const ignored = attachesNodes() ? [] : plan.nodeWarnings ?? [];
     for (const warning of plan.warnings ?? []) {
-      children.push(h("div", { className: "dl-notice dl-warn-box" }, warning));
+      if (!ignored.includes(warning)) {
+        children.push(h("div", { className: "dl-notice dl-warn-box" }, warning));
+      }
     }
     const excluded = excludedModels();
     if (excluded.length) {
@@ -1178,6 +1216,30 @@ function renderStatus() {
           "div",
           { className: "dl-notice dl-warn-box" },
           `Not attaching ${excluded.join(", ")}. The job fails unless the workers already have it, for example through Extra Model Paths Config.`
+        )
+      );
+    }
+    const largePacks = attachesNodes()
+      ? (plan.localNodes ?? []).filter(
+          (pack) => isLargePack(pack) && !state.removedAttachments.has(pack.path)
+        )
+      : [];
+    for (const pack of largePacks) {
+      children.push(
+        h(
+          "div",
+          { className: "dl-notice dl-warn-box" },
+          `The custom node pack ${pack.name} is ${packSize(pack)}. A job that uses one of its nodes uploads the whole pack. Remove it under Attachments if the workers already have it.`
+        )
+      );
+    }
+    const removedPacks = attachesNodes() ? excludedNodes() : [];
+    if (removedPacks.length) {
+      children.push(
+        h(
+          "div",
+          { className: "dl-notice dl-warn-box" },
+          `Not attaching the custom nodes in ${removedPacks.join(", ")}. The job fails unless the workers already have them, such as from a custom nodes conda package.`
         )
       );
     }
@@ -1209,7 +1271,7 @@ function parameterControl(
   if (control === "CHECK_BOX") {
     return h("input", {
       type: "checkbox",
-      checked: String(value).toLowerCase() === "true",
+      checked: parseBool(value) === true,
       onChange: (event: Event) => onChange(inputChecked(event) ? "true" : "false"),
     });
   }
@@ -1259,6 +1321,9 @@ function renderParameters() {
           parameter.userInterface?.label || parameter.name,
           parameterControl(parameter, parameterValue(parameter), (value: string) => {
             state.edits[parameter.name] = value;
+            if (parameter.name === ATTACH_NODES_PARAMETER) {
+              refresh("status", "attachments");
+            }
           }),
           parameter.description
         )
@@ -1779,6 +1844,47 @@ function excludedModels(): string[] {
     .map((model) => model.id);
 }
 
+// The panel warns about a pack above either of these. A job that uses the pack uploads it.
+const LARGE_PACK_BYTES = 1_000_000_000;
+const LARGE_PACK_FILES = 10_000;
+
+// A size in bytes, such as 1.5 GB. Storage and transfer sizes count in thousands.
+export function formatSize(bytes: number): string {
+  const units = ["bytes", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1000 && unit < units.length - 1) {
+    value /= 1000;
+    unit += 1;
+  }
+  return unit === 0 ? `${bytes} bytes` : `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`;
+}
+
+function packSize(pack: LocalNode): string | null {
+  if (pack.size === undefined || pack.files === undefined) {
+    return null;
+  }
+  const files = `${pack.files.toLocaleString("en-US")} files`;
+  return pack.counted === false
+    ? `at least ${formatSize(pack.size)} in over ${files}`
+    : `${formatSize(pack.size)} in ${files}`;
+}
+
+function isLargePack(pack: LocalNode): boolean {
+  return (
+    pack.counted === false ||
+    (pack.size ?? 0) > LARGE_PACK_BYTES ||
+    (pack.files ?? 0) > LARGE_PACK_FILES
+  );
+}
+
+// The custom node packs the artist removed. With Attach Custom Nodes off, none are attached.
+function excludedNodes(): string[] {
+  return (state.plan?.localNodes ?? [])
+    .filter((pack) => state.removedAttachments.has(pack.path))
+    .map((pack) => pack.name);
+}
+
 function attachmentItem(
   text: string,
   path: string,
@@ -1827,10 +1933,12 @@ function renderAttachments() {
     }
   }
   const localModels = state.plan.localModels ?? [];
+  const localNodes = attachesNodes() ? state.plan.localNodes ?? [] : [];
   const attachedCount =
     [...rows.keys()].filter((path) => !state.removedAttachments.has(path)).length +
     localModels.length -
-    excludedModels().length;
+    excludedModels().length +
+    localNodes.filter((pack) => !state.removedAttachments.has(pack.path)).length;
   const remove = (row: Row) => () => {
     if (row.manual) {
       added[row.key] = added[row.key].filter((path) => path !== row.path);
@@ -1843,12 +1951,12 @@ function renderAttachments() {
     state.removedAttachments.delete(row.path);
     refresh("attachments");
   };
-  // Removing a model can make the job fail, so the status warns about it.
-  const toggleModel = (model: { path: string }, removed: boolean) => () => {
+  // Removing a model or a custom node pack can make the job fail. The status warns about it.
+  const toggleFound = (found: { path: string }, removed: boolean) => () => {
     if (removed) {
-      state.removedAttachments.add(model.path);
+      state.removedAttachments.add(found.path);
     } else {
-      state.removedAttachments.delete(model.path);
+      state.removedAttachments.delete(found.path);
     }
     refresh("status", "attachments");
   };
@@ -1888,8 +1996,26 @@ function renderAttachments() {
                 model.id,
                 model.path,
                 null,
-                toggleModel(model, true),
-                toggleModel(model, false)
+                toggleFound(model, true),
+                toggleFound(model, false)
+              )
+            )
+          ),
+        ]
+      : null,
+    localNodes.length
+      ? [
+          h("div", { className: "dl-label" }, "Custom nodes the workflow uses, attached automatically"),
+          h(
+            "ul",
+            { className: "dl-files" },
+            localNodes.map((pack) =>
+              attachmentItem(
+                packSize(pack) ? `${pack.name} (${packSize(pack)})` : pack.name,
+                pack.path,
+                null,
+                toggleFound(pack, true),
+                toggleFound(pack, false)
               )
             )
           ),

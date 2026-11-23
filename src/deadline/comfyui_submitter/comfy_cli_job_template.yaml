@@ -2,8 +2,10 @@ specificationVersion: 'jobtemplate-2023-09'
 name: ComfyUI Workflow (comfy-cli)
 description: >
   Runs a ComfyUI workflow headlessly with comfy-cli. A job environment starts ComfyUI once
-  per session with comfy launch, loading the models attached to the job, and the task runs
-  the workflow with comfy run.
+  per session with comfy launch, loading the models and custom nodes attached to the job,
+  and the task runs the workflow with comfy run.
+# Attach Custom Nodes is a BOOL parameter, which needs EXPR.
+extensions: ["EXPR"]
 
 parameterDefinitions:
 
@@ -76,6 +78,29 @@ parameterDefinitions:
     ComfyUI at more model folders or custom_nodes folders, for example on shared
     storage. ComfyUI also searches the models attached to the job.
 
+# Custom Node Parameters
+- name: AttachCustomNodes
+  type: BOOL
+  userInterface:
+    control: CHECK_BOX
+    label: Attach Custom Nodes
+    groupLabel: Custom Node Parameters
+  default: "true"
+  description: >
+    Load the custom node packs attached under Custom Nodes Directory on the worker, and
+    install their Python dependencies into a session virtual environment layered on the
+    conda environment. pip can't replace the conda environment's packages, but a pack's
+    code runs as the job's user. Turn off when the workers already provide
+    every custom node and its dependencies, for example from a custom nodes conda package;
+    Custom Nodes Directory is then ignored.
+- name: CustomNodesDirectory
+  type: PATH
+  objectType: DIRECTORY
+  dataFlow: NONE
+  userInterface:
+    control: HIDDEN
+  default: ""
+
 # Advanced Parameters
 - name: ComfyUIArgs
   type: STRING
@@ -133,6 +158,8 @@ jobEnvironments:
     COMFY_NO_TELEMETRY: "1"
     COMFYUI_SESSION_DIR: "{{Session.WorkingDirectory}}"
     COMFYUI_MODEL_DIRECTORY: "{{Param.ModelDirectory}}"
+    COMFYUI_ATTACH_CUSTOM_NODES: "{{Param.AttachCustomNodes}}"
+    COMFYUI_CUSTOM_NODES_DIRECTORY: "{{Param.CustomNodesDirectory}}"
     COMFYUI_EXTRA_MODEL_PATHS_CONFIG: "{{Param.ExtraModelPathsConfig}}"
     COMFYUI_INPUT_DIR: "{{Param.InputDir}}"
     COMFYUI_OUTPUT_DIR: "{{Param.OutputDir}}"
@@ -144,7 +171,7 @@ jobEnvironments:
     actions:
       onEnter:
         command: bash
-        args: ['{{Env.File.Enter}}']
+        args: ['{{Env.File.Enter}}', '{{Env.File.CheckRequirements}}']
         timeout: 7200
       onExit:
         command: bash
@@ -187,10 +214,33 @@ jobEnvironments:
                 if folder.is_dir() and re.fullmatch(r"[A-Za-z0-9_]+", folder.name)
             }
             paths["model_directory"] = {"base_path": model_directory, **folders}
+        # Param.CustomNodesDirectory is the folder where the custom node packs were attached.
+        # It's skipped when AttachCustomNodes is off: the workers then provide every custom node
+        # themselves, such as from a conda package.
+        nodes_directory = os.environ["COMFYUI_CUSTOM_NODES_DIRECTORY"]
+        if (
+            os.environ["COMFYUI_ATTACH_CUSTOM_NODES"] == "true"
+            and nodes_directory
+            and Path(nodes_directory).is_dir()
+        ):
+            paths["attached_custom_nodes"] = {"custom_nodes": nodes_directory}
         with open(Path(os.environ["COMFYUI_SESSION_DIR"]) / "extra_model_paths.yaml", "w") as f:
             if paths:
                 json.dump(paths, f, indent=2)
         PY
+        ATTACHED_NODES=()
+        if [ "$COMFYUI_ATTACH_CUSTOM_NODES" = true ] && [ -n "$COMFYUI_CUSTOM_NODES_DIRECTORY" ] \
+            && [ -d "$COMFYUI_CUSTOM_NODES_DIRECTORY" ]; then
+            for NODE_DIR in "$COMFYUI_CUSTOM_NODES_DIRECTORY"/*/; do
+                if [ -d "$NODE_DIR" ]; then
+                    ATTACHED_NODES+=("${NODE_DIR%/}")
+                fi
+            done
+        fi
+        if [ ${#ATTACHED_NODES[@]} -gt 0 ]; then
+            python -c 'import os, sys; print("Attached custom nodes: " + ", ".join(repr(os.path.basename(path)) for path in sys.argv[1:]))' \
+                "${ATTACHED_NODES[@]}" 2>&1 | diagnostics
+        fi
         # ComfyUI can't read an empty extra model paths file, so it's only passed with entries.
         MODEL_PATH_FILES=()
         if [ -s "$MODEL_PATHS" ]; then
@@ -218,6 +268,40 @@ jobEnvironments:
             2>&1 | diagnostics
         mkdir -p -- "$BASE_DIR/custom_nodes" "$COMFYUI_OUTPUT_DIR" "$INPUT_DIR" \
             2>&1 | diagnostics
+
+        # The attached packs' pip dependencies go into a virtual environment layered on the conda
+        # environment, which comfy launch uses because VIRTUAL_ENV is set. The constraints keep
+        # pip from replacing the conda environment's packages, such as torch. They don't limit
+        # what a pack's code, or a package pip builds from source, does as the job's user.
+        # AttachCustomNodes off skips this: the workers provide the custom nodes.
+        if [ ${#ATTACHED_NODES[@]} -gt 0 ]; then
+            VENV="$COMFYUI_SESSION_DIR/node-venv"
+            python -m venv --system-site-packages "$VENV" 2>&1 | diagnostics \
+                || { echo "openjd_fail: Couldn't create a virtual environment for the custom nodes"; exit 1; }
+            export VIRTUAL_ENV="$VENV" PATH="$VENV/bin:$PATH"
+            # Pins every package the conda environment has. pip freeze writes the ones conda
+            # installed as "name @ file:///...", which a constraints file can't hold, so they'd
+            # go unpinned. pip list writes every package as name==version.
+            export PIP_CONSTRAINT="$COMFYUI_SESSION_DIR/constraints.txt"
+            "$VENV/bin/python" -m pip list --format=freeze 2>&1 > "$PIP_CONSTRAINT" | diagnostics \
+                || { echo "openjd_fail: Couldn't list the conda environment's packages"; exit 1; }
+            for NODE_DIR in "${ATTACHED_NODES[@]}"; do
+                if [ -f "$NODE_DIR/requirements.txt" ]; then
+                    # A folder name can hold line breaks, which would start a new OpenJD line.
+                    NAME="${NODE_DIR##*/}"
+                    NAME="${NAME//[$'\r\n']/ }"
+                    # A pack's requirements.txt can't choose where pip installs from. $1 is the
+                    # CheckRequirements script.
+                    "$VENV/bin/python" "$1" "$NODE_DIR/requirements.txt" 2>&1 | diagnostics \
+                        || { echo "openjd_fail: The requirements of $NAME use pip options, paths or URLs that jobs don't install"; exit 1; }
+                    echo "openjd_status: Installing the requirements of $NAME"
+                    "$VENV/bin/python" -m pip install -r "$NODE_DIR/requirements.txt" 2>&1 | diagnostics \
+                        || { echo "openjd_fail: Couldn't install the requirements of $NAME"; exit 1; }
+                fi
+            done
+            "$VENV/bin/python" -m pip check 2>&1 | diagnostics \
+                || { echo "openjd_fail: The custom nodes' dependencies conflict"; exit 1; }
+        fi
 
         PORT=$(python -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
         echo "openjd_status: Starting ComfyUI with comfy launch"
@@ -285,6 +369,52 @@ jobEnvironments:
         done
         echo "openjd_fail: The ComfyUI server didn't start within ${COMFYUI_SERVER_START_TIMEOUT}s"
         exit 1
+    - name: CheckRequirements
+      filename: check-requirements.py
+      type: TEXT
+      data: |
+        """
+        Checks a custom node pack's requirements.txt before pip installs it. pip also reads options
+        from the file, such as --index-url, --extra-index-url and --trusted-host, as well as nested
+        files, editable installs, local paths and URLs, and it expands environment variables in
+        them. The worker runs pip with the queue role's credentials, so a pack can't point it at
+        another package index. Package names and https URLs, such as git+https, are installed.
+        Prints each line that isn't, and exits with 1.
+        """
+        import re
+        import sys
+
+        ALLOWED_SCHEMES = {"https", "git+https"}
+
+        with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+            # pip joins a line that ends with a backslash to the next one.
+            text = re.sub(r"\\\r?\n", "", f.read())
+        refused = []
+        # pip splits the file with splitlines().
+        for number, line in enumerate(text.splitlines(), start=1):
+            requirement = re.sub(r"(^|\s)#.*", "", line).strip()
+            if not requirement:
+                continue
+            words = requirement.split()
+            schemes = {
+                scheme.lower() for scheme in re.findall(r"([A-Za-z][A-Za-z0-9+.-]*)://", requirement)
+            }
+            if requirement.startswith("-"):
+                reason = "it's a pip option"
+            elif any(word.startswith("-") and not word.startswith("--hash") for word in words[1:]):
+                reason = "it has a pip option"
+            elif "${" in requirement:
+                reason = "it reads an environment variable"
+            elif schemes - ALLOWED_SCHEMES:
+                reason = "only https URLs are installed"
+            elif re.match(r"[./~\\]|file:|[A-Za-z]:[/\\]", requirement):
+                reason = "it's a local path"
+            else:
+                continue
+            refused.append(f"Line {number}, {requirement!r}: {reason}")
+        for message in refused:
+            print(message)
+        sys.exit(1 if refused else 0)
     - name: Exit
       filename: exit-comfyui-server.sh
       type: TEXT

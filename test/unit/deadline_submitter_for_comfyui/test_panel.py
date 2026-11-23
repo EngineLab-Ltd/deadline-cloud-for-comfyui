@@ -201,6 +201,22 @@ def test_attachment_lists_keep_independent_scroll_positions_when_updated(run_sce
     assert result["attachmentsStillOpen"] is True
 
 
+def test_a_custom_node_pack_can_be_removed_and_added_back(run_scenario):
+    """A pack can hold keys in its settings, which anyone who can use the queue could read."""
+    result = run_scenario("all-attachments")
+    assert result["packRow"].startswith("studio-nodes (3.2 GB in 12,500 files)")
+    # A job uploads a large pack until the artist removes it.
+    assert (
+        "The custom node pack studio-nodes is 3.2 GB in 12,500 files." in result["largePackStatus"]
+    )
+    assert "The custom node pack" not in result["packStatus"]
+    assert result["packRowRemoved"] == "dl-removed"
+    assert "Not attaching the custom nodes in studio-nodes." in result["packStatus"]
+    assert result["excludedNodes"] == ["studio-nodes"]
+    assert "Not attaching the custom nodes" not in result["packStatusAfterRestoring"]
+    assert result["excludedNodesAfterRestoring"] == []
+
+
 def test_a_model_is_removed_by_its_folder_and_name(run_scenario):
     """Two models with the same file name, in different folders, are removed one at a time."""
     result = run_scenario("same-name-models")
@@ -268,3 +284,8 @@ def test_a_submitted_job_remembers_where_its_outputs_download_to(run_scenario):
 )
 def test_a_finished_download_says_where_the_files_are(run_scenario, scenario, destination):
     assert run_scenario(scenario)["toasts"] == [f"Downloaded 2 files from fox {destination}."]
+
+
+def test_bool_parameters_are_read_as_openjd_reads_them(run_scenario):
+    """So the Attach Custom Nodes checkbox and the attachments agree with what the job does."""
+    assert run_scenario("parse-bool")["values"] == [True] * 6 + [False] * 6 + [None] * 5

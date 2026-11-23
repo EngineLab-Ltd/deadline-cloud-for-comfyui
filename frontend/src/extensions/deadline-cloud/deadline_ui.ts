@@ -591,7 +591,8 @@ function parameterValue(parameter: Parameter): ParameterValue {
 // A BOOL job parameter's value as OpenJD reads it, or null when OpenJD would refuse it. The
 // submitter reads it the same way.
 export function parseBool(value: ParameterValue): boolean | null {
-  const text = String(value).trim().toLowerCase();
+  // OpenJD refuses a value with spaces around it, such as " true".
+  const text = String(value).toLowerCase();
   if (["true", "yes", "on", "1"].includes(text)) {
     return true;
   }

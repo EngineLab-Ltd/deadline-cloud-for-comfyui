@@ -256,4 +256,4 @@ def test_a_finished_download_says_where_the_files_are(run_scenario, scenario, de
 
 def test_bool_parameters_are_read_as_openjd_reads_them(run_scenario):
     """So the Attach Custom Nodes checkbox and the attachments agree with what the job does."""
-    assert run_scenario("parse-bool")["values"] == [True] * 6 + [False] * 6 + [None] * 3
+    assert run_scenario("parse-bool")["values"] == [True] * 6 + [False] * 6 + [None] * 5

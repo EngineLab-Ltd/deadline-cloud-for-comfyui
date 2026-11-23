@@ -354,9 +354,12 @@ if (scenario === "edited-before-replanning") {
 }
 if (scenario === "parse-bool") {
   // The panel reads a BOOL parameter as OpenJD and the submitter do.
-  result.values = [true, "true", "Yes", " ON ", "1", 1, false, "FALSE", "no", "off", "0", 0, "", "garbage", 2].map(
-    ui.parseBool
-  );
+  result.values = [
+    ...[true, "true", "Yes", "ON", "1", 1],
+    ...[false, "FALSE", "no", "off", "0", 0],
+    // OpenJD refuses spaces around a BOOL.
+    ...["", "garbage", 2, " true", "off "],
+  ].map(ui.parseBool);
 }
 console.log(JSON.stringify(result));
 process.exit(0);

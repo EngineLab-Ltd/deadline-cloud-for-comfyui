@@ -532,7 +532,8 @@ def parse_bool(value: Any) -> bool | None:
         return value
     if isinstance(value, int):
         return {0: False, 1: True}.get(value)
-    text = str(value).strip().lower()
+    # OpenJD refuses a value with spaces around it, such as " true".
+    text = str(value).lower()
     if text in _TRUE_VALUES:
         return True
     if text in _FALSE_VALUES:
@@ -548,7 +549,13 @@ def _number(value: Any, kind: str) -> int | float | None:
         if isinstance(value, int):
             return value
         text = str(value).strip()
-        return int(text) if _INT_VALUE.fullmatch(text) else None
+        if not _INT_VALUE.fullmatch(text):
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            # Python refuses a number of over 4300 digits, as OpenJD does.
+            return None
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -560,7 +567,7 @@ def check_parameter_values(
     definitions: list[dict[str, Any]], parameters: Mapping[str, Any]
 ) -> None:
     """
-    Checks the values of the job template's BOOL, INT, FLOAT and STRING parameters as Deadline
+    Checks the values of the job template's BOOL, INT, FLOAT, STRING and PATH parameters as Deadline
     Cloud would, so a bad one is refused before the bundle is created and files are copied for
     it. Parameters the template doesn't define, such as the queue's, are left to the library.
     Raises SubmitError.
@@ -588,7 +595,7 @@ def check_parameter_values(
                 raise SubmitError(f"{label} must be at least {low}, not {value!r}.")
             if high is not None and checked > high:
                 raise SubmitError(f"{label} must be at most {high}, not {value!r}.")
-        elif kind == "STRING":
+        elif kind in ("STRING", "PATH"):
             checked = str(value)
             shortest, longest = definition.get("minLength"), definition.get("maxLength")
             if shortest is not None and len(checked) < int(shortest):
@@ -599,7 +606,7 @@ def check_parameter_values(
             continue
         allowed = definition.get("allowedValues")
         if allowed and checked not in [
-            _number(item, kind) if kind != "STRING" else str(item) for item in allowed
+            str(item) if kind in ("STRING", "PATH") else _number(item, kind) for item in allowed
         ]:
             choices = ", ".join(str(item) for item in allowed)
             raise SubmitError(f"{label} must be one of {choices}, not {value!r}.")

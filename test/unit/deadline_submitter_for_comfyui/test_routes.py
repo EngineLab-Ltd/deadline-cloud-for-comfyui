@@ -2233,7 +2233,7 @@ def _staged_node_packs(response: dict) -> list[str]:
     return directories
 
 
-@pytest.mark.parametrize("value", ["no", "OFF", "0", 0, " False "])
+@pytest.mark.parametrize("value", ["no", "OFF", "0", 0, "False"])
 def test_jobs_read_attach_custom_nodes_as_openjd_does(comfy, monkeypatch, value):
     """OpenJD reads each of these as false, so the job wouldn't load the packs."""
     fake_cli(monkeypatch, comfy.tmp_path, "")

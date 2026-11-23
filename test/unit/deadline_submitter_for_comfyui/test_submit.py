@@ -569,9 +569,11 @@ def test_picker_command_on_linux(monkeypatch):
 
 @pytest.mark.parametrize(
     ("value", "expected"),
-    [(True, True), ("true", True), ("Yes", True), (" ON ", True), ("1", True), (1, True)]
+    [(True, True), ("true", True), ("Yes", True), ("ON", True), ("1", True), (1, True)]
     + [(False, False), ("FALSE", False), ("no", False), ("off", False), ("0", False), (0, False)]
-    + [("", None), ("garbage", None), (2, None), ("1.0", None), (None, None)],
+    + [("", None), ("garbage", None), (2, None), ("1.0", None), (None, None)]
+    # OpenJD refuses spaces around a BOOL.
+    + [(" true", None), ("false ", None), (" ON ", None)],
 )
 def test_parse_bool_reads_bool_parameters_as_openjd_does(value, expected):
     assert submit.parse_bool(value) is expected
@@ -584,6 +586,13 @@ TYPED_PARAMETERS: list[dict[str, Any]] = [
     {"name": "Mode", "type": "STRING", "allowedValues": ["fast", "best"]},
     {"name": "Tag", "type": "STRING", "minLength": 2, "maxLength": 4},
     {"name": "Out", "type": "PATH"},
+    {
+        "name": "Folder",
+        "type": "PATH",
+        "minLength": 3,
+        "maxLength": 8,
+        "allowedValues": ["/a/b", "/shared"],
+    },
 ]
 
 
@@ -591,7 +600,9 @@ TYPED_PARAMETERS: list[dict[str, Any]] = [
     "parameters",
     [
         {"Switch": "off", "Steps": "20", "Scale": "2.5", "Mode": "best", "Tag": "abc"},
-        {"Steps": 50, "Scale": 1, "Out": ""},
+        {"Steps": 50, "Scale": 1, "Out": "", "Folder": "/shared"},
+        # OpenJD reads spaces around an INT.
+        {"Steps": " 20 "},
         # Parameters the template doesn't define, such as the queue's, are the library's to check.
         {"CondaChannels": "deadline-cloud"},
     ],
@@ -614,6 +625,11 @@ def test_check_parameter_values_accepts_what_openjd_does(parameters):
         ({"Mode": "slow"}, "Mode must be one of fast, best, not 'slow'."),
         ({"Tag": "a"}, "Tag must be at least 2 characters long."),
         ({"Tag": "abcde"}, "Tag must be at most 4 characters long."),
+        ({"Switch": " true"}, "Switch must be true or false, not ' true'."),
+        ({"Steps": "1" * 4301}, "Steps must be a whole number, not '" + "1" * 4301 + "'."),
+        ({"Folder": "/a"}, "Folder must be at least 3 characters long."),
+        ({"Folder": "/a/b/c/d/e"}, "Folder must be at most 8 characters long."),
+        ({"Folder": "/elsewhere"[:8]}, "Folder must be one of /a/b, /shared, not '/elsewhe'."),
     ],
 )
 def test_check_parameter_values_says_what_is_wrong(parameters, error):

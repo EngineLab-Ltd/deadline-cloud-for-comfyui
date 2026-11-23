@@ -551,6 +551,9 @@ def test_stage_local_node_packs_leaves_out_files_that_can_hold_credentials(comfy
         "auth/Credentials.py",
         "auth/.env.py",
         "web/credentials.js",
+        "token.py",
+        "tokenizer.json",
+        "models/tokenizer_config.json",
     )
     for kept in kept_files:
         touch(pack / kept)
@@ -564,6 +567,24 @@ def test_stage_local_node_packs_leaves_out_files_that_can_hold_credentials(comfy
         "credentials.cfg",
         "auth/Credentials.TXT",
         "secrets.json",
+        ".git-credentials",
+        ".npmrc",
+        ".pypirc",
+        "token",
+        "hf_token",
+        "api_key.txt",
+        "putty.ppk",
+        "id_dsa",
+        "service_account.json",
+        "client_secret_1234.json",
+        "prod.env",
+        ".envrc",
+        ".boto",
+        ".s3cfg",
+        "kubeconfig",
+        "keys/release.jks",
+        ".htpasswd",
+        "nested/deeper/hf_token",
     ):
         touch(pack / secret)
     dest = tmp_path / "local_nodes"
@@ -607,7 +628,62 @@ def test_stage_local_node_packs_keeps_links_inside_the_pack_only(comfy, tmp_path
     assert _staged_files(dest, "linked-nodes") == ["__init__.py", "data/styles.csv", "styles.csv"]
     assert caplog.text.count("it links outside the pack") == 2
     assert "config.txt out of the job: it can hold credentials" in caplog.text
-    assert "it links to a folder that holds it" in caplog.text
+    assert "loop out of the job: it links to a folder in the pack" in caplog.text
+
+
+def test_stage_local_node_packs_keeps_relative_links(comfy, tmp_path, monkeypatch):
+    """A relative link is read from its own folder, not from the server's working directory."""
+    pack = comfy["custom_nodes"] / "linked-nodes"
+    touch(pack / "nodes" / "real.py")
+    try:
+        (pack / "nodes" / "alias.py").symlink_to("real.py")
+    except OSError:
+        pytest.skip("This system can't create symbolic links.")
+    monkeypatch.chdir(tmp_path)
+    dest = tmp_path / "local_nodes"
+    stage_local_node_packs({"linked-nodes": pack}, dest)
+    assert _staged_files(dest, "linked-nodes") == ["nodes/alias.py", "nodes/real.py"]
+
+
+def test_stage_local_node_packs_leaves_out_links_into_left_out_folders(comfy, tmp_path, caplog):
+    """A link can't bring back what's left out, such as .git/config, which can hold a token."""
+    pack = comfy["custom_nodes"] / "linked-nodes"
+    touch(pack / "__init__.py")
+    touch(pack / ".git" / "config")
+    touch(pack / "__pycache__" / "nodes.cpython-312.pyc")
+    _symlink(pack / "repo", pack / ".git")
+    _symlink(pack / "git_config.txt", pack / ".git" / "config")
+    _symlink(pack / "cache.bin", pack / "__pycache__" / "nodes.cpython-312.pyc")
+    dest = tmp_path / "local_nodes"
+    stage_local_node_packs({"linked-nodes": pack}, dest)
+    assert _staged_files(dest, "linked-nodes") == ["__init__.py"]
+    assert "repo out of the job: it links to a folder in the pack" in caplog.text
+    assert caplog.text.count("it links to a file that's left out") == 2
+
+
+def test_stage_local_node_packs_stops_at_links_between_sibling_folders(comfy, tmp_path, caplog):
+    """Folders that link to each other would otherwise be copied into each other again and again."""
+    pack = comfy["custom_nodes"] / "linked-nodes"
+    touch(pack / "a" / "a.py")
+    touch(pack / "b" / "b.py")
+    _symlink(pack / "a" / "to_b", pack / "b")
+    _symlink(pack / "b" / "to_a", pack / "a")
+    dest = tmp_path / "local_nodes"
+    stage_local_node_packs({"linked-nodes": pack}, dest)
+    assert _staged_files(dest, "linked-nodes") == ["a/a.py", "b/b.py"]
+    assert caplog.text.count("it links to a folder in the pack") == 2
+
+
+def test_stage_local_node_packs_refuses_names_that_differ_only_in_case(comfy, tmp_path, caplog):
+    """On a file system that ignores case, both packs would be merged into one folder."""
+    first = touch(tmp_path / "root1" / "MyPack" / "first.py").parent
+    second = touch(tmp_path / "root2" / "mypack" / "second.py").parent
+    dest = tmp_path / "local_nodes"
+    assert stage_local_node_packs({"MyPack": first, "mypack": second}, dest) == {
+        "MyPack": dest / "MyPack"
+    }
+    assert _staged_files(dest, "MyPack") == ["first.py"]
+    assert "its name and 'MyPack' differ in case alone" in caplog.text
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Named pipes are POSIX only.")

@@ -223,20 +223,56 @@ _SKIPPED_NODE_DIRS = frozenset(
 
 # Left out of staged node packs: files that usually hold credentials, such as an API-backed
 # pack's keys. Job attachments can be read by anyone who can use the queue. Settings files such
-# as config.json are kept, since packs need them to run.
+# as config.json are kept, since packs need them to run, so a list of names can't catch every
+# secret: the panel lets the artist leave a whole pack out.
 _SECRET_NODE_FILES = (
+    # Environment files, such as .env.local and prod.env.
     ".env",
     ".env.*",
+    "*.env",
+    ".envrc",
+    # Keys and certificates.
     "*.pem",
     "*.key",
     "*.p12",
     "*.pfx",
+    "*.ppk",
+    "*.jks",
+    "*.keystore",
     "id_rsa",
+    "id_dsa",
     "id_ecdsa",
     "id_ed25519",
+    # Tokens and API keys, such as hf_token and api_key.txt. tokenizer.json isn't one.
+    "token",
+    "token.*",
+    "*_token",
+    "*_token.*",
+    "*-token",
+    "*-token.*",
+    "api_key",
+    "api_key.*",
+    "*_api_key",
+    "*_api_key.*",
+    "apikey",
+    "apikey.*",
+    # Credentials of other tools.
     ".netrc",
+    ".git-credentials",
+    ".npmrc",
+    ".pypirc",
+    ".pgpass",
+    ".htpasswd",
+    ".boto",
+    ".s3cfg",
+    ".dockercfg",
+    "kubeconfig",
+    "*.kubeconfig",
     "credentials",
     "credentials.*",
+    "service_account*.json",
+    "service-account*.json",
+    "client_secret*.json",
     "secrets.json",
     "secrets.toml",
     "secrets.yaml",
@@ -260,30 +296,56 @@ def _ignore_node_files(root: Path, directory: str, names: list[str]) -> set[str]
     """
     The entries of a pack's folder to leave out of the job. root is the pack's folder, resolved.
     copytree follows links, so an entry is attached only when it resolves inside the pack, and is
-    checked for credentials by its target's name as well as its own. Every entry is resolved, not
-    only symbolic links, since Python doesn't count a Windows directory junction as one.
+    checked as its target as well as by its own name. A link to a folder in the pack is left out:
+    the folder is attached under its own name, and following it could loop. Every entry is
+    resolved, not only symbolic links, since Python doesn't count a Windows directory junction as
+    one.
     """
     ignored = set()
+    real_directory = os.path.realpath(directory)
     for name in names:
         path = Path(directory, name)
-        if name in _SKIPPED_NODE_DIRS or name.endswith(".pyc") or (path / "pyvenv.cfg").is_file():
+        if _skipped_node_entry(name, path):
             ignored.add(name)
             continue
         target = path.resolve()
+        is_link = str(target) != os.path.join(real_directory, name)
         if not target.is_relative_to(root):
             logger.warning("Leaving %s out of the job: it links outside the pack", path)
-            ignored.add(name)
-        elif target.is_dir() and Path(directory).resolve().is_relative_to(target):
-            logger.warning("Leaving %s out of the job: it links to a folder that holds it", path)
             ignored.add(name)
         elif not (path.is_file() or path.is_dir()):
             # Such as a named pipe, which would block the copy, or a link to nothing.
             logger.warning("Leaving %s out of the job: it isn't a file or a folder", path)
             ignored.add(name)
+        elif is_link and path.is_dir():
+            logger.warning(
+                "Leaving %s out of the job: it links to a folder in the pack, which is attached "
+                "under its own name",
+                path,
+            )
+            ignored.add(name)
+        elif is_link and _in_skipped_node_entry(root, target):
+            logger.warning("Leaving %s out of the job: it links to a file that's left out", path)
+            ignored.add(name)
         elif path.is_file() and (_is_secret_node_file(name) or _is_secret_node_file(target.name)):
             logger.warning("Leaving %s out of the job: it can hold credentials", path)
             ignored.add(name)
     return ignored
+
+
+def _skipped_node_entry(name: str, path: Path) -> bool:
+    """Version control, caches, compiled Python and virtual environments."""
+    return name in _SKIPPED_NODE_DIRS or name.endswith(".pyc") or (path / "pyvenv.cfg").is_file()
+
+
+def _in_skipped_node_entry(root: Path, target: Path) -> bool:
+    """Whether a link's target in the pack is, or is inside, an entry that's left out."""
+    path = root
+    for part in target.relative_to(root).parts:
+        path = path / part
+        if _skipped_node_entry(part, path):
+            return True
+    return False
 
 
 def _link_or_copy(source: str, target: str, copied: list[str] | None = None) -> str:
@@ -310,10 +372,22 @@ def stage_local_node_packs(packs: Mapping[str, Path], dest: Path) -> dict[str, P
     are left out of folders. A pack that cannot be placed is logged and left out.
     """
     staged: dict[str, Path] = {}
+    # Packs from two custom node folders, such as MyPack and mypack, would share one folder on a
+    # file system that ignores case.
+    folded: dict[str, str] = {}
     for name, source in packs.items():
         if not name or name != source.name or PurePath(name).name != name or name in (".", ".."):
             logger.warning("Not staging custom node pack %r from %s", name, source)
             continue
+        if name.casefold() in folded:
+            logger.warning(
+                "Not staging custom node pack %r from %s: its name and %r differ in case alone",
+                name,
+                source,
+                folded[name.casefold()],
+            )
+            continue
+        folded[name.casefold()] = name
         target = dest / name
         copied: list[str] = []
         try:
@@ -324,7 +398,6 @@ def stage_local_node_packs(packs: Mapping[str, Path], dest: Path) -> dict[str, P
                     target,
                     ignore=functools.partial(_ignore_node_files, source.resolve()),
                     copy_function=functools.partial(_link_or_copy, copied=copied),
-                    ignore_dangling_symlinks=True,
                     dirs_exist_ok=True,
                 )
             elif source.is_file() and source.suffix == ".py":

@@ -693,6 +693,7 @@ function bundleRequest() {
     hostRequirements: state.hostForm ? requirementsFromForm(state.hostForm) : undefined,
     attachments: attachments(),
     excludedModels: excludedModels(),
+    excludedNodes: excludedNodes(),
   };
 }
 
@@ -1197,6 +1198,16 @@ function renderStatus() {
           "div",
           { className: "dl-notice dl-warn-box" },
           `Not attaching ${excluded.join(", ")}. The job fails unless the workers already have it, for example through Extra Model Paths Config.`
+        )
+      );
+    }
+    const removedPacks = attachesNodes() ? excludedNodes() : [];
+    if (removedPacks.length) {
+      children.push(
+        h(
+          "div",
+          { className: "dl-notice dl-warn-box" },
+          `Not attaching the custom nodes in ${removedPacks.join(", ")}. The job fails unless the workers already have them, such as from a custom nodes conda package.`
         )
       );
     }
@@ -1801,6 +1812,13 @@ function excludedModels(): string[] {
     .map((model) => model.id);
 }
 
+// The custom node packs the artist removed. With Attach Custom Nodes off, none are attached.
+function excludedNodes(): string[] {
+  return (state.plan?.localNodes ?? [])
+    .filter((pack) => state.removedAttachments.has(pack.path))
+    .map((pack) => pack.name);
+}
+
 function attachmentItem(
   text: string,
   path: string,
@@ -1854,7 +1872,7 @@ function renderAttachments() {
     [...rows.keys()].filter((path) => !state.removedAttachments.has(path)).length +
     localModels.length -
     excludedModels().length +
-    localNodes.length;
+    localNodes.filter((pack) => !state.removedAttachments.has(pack.path)).length;
   const remove = (row: Row) => () => {
     if (row.manual) {
       added[row.key] = added[row.key].filter((path) => path !== row.path);
@@ -1867,12 +1885,12 @@ function renderAttachments() {
     state.removedAttachments.delete(row.path);
     refresh("attachments");
   };
-  // Removing a model can make the job fail, so the status warns about it.
-  const toggleModel = (model: { path: string }, removed: boolean) => () => {
+  // Removing a model or a custom node pack can make the job fail. The status warns about it.
+  const toggleFound = (found: { path: string }, removed: boolean) => () => {
     if (removed) {
-      state.removedAttachments.add(model.path);
+      state.removedAttachments.add(found.path);
     } else {
-      state.removedAttachments.delete(model.path);
+      state.removedAttachments.delete(found.path);
     }
     refresh("status", "attachments");
   };
@@ -1912,8 +1930,8 @@ function renderAttachments() {
                 model.id,
                 model.path,
                 null,
-                toggleModel(model, true),
-                toggleModel(model, false)
+                toggleFound(model, true),
+                toggleFound(model, false)
               )
             )
           ),
@@ -1926,7 +1944,13 @@ function renderAttachments() {
             "ul",
             { className: "dl-files" },
             localNodes.map((pack) =>
-              h("li", { title: pack.path }, h("span", { className: "dl-path" }, pack.name))
+              attachmentItem(
+                pack.name,
+                pack.path,
+                null,
+                toggleFound(pack, true),
+                toggleFound(pack, false)
+              )
             )
           ),
         ]

@@ -151,6 +151,8 @@ class _Prepared:
     local_nodes: dict[str, Path] = field(default_factory=dict)
     installed_nodes: _InstalledNodes | None = None
     node_warnings: list[str] = field(default_factory=list)
+    # The packs the artist chose not to attach, by name.
+    removed_nodes: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -466,7 +468,7 @@ def _stage_prepared(
     if not attach_nodes or set(nodes) != set(prepared.local_nodes):
         prepared.warnings = [w for w in prepared.warnings if w not in prepared.node_warnings]
         prepared.node_warnings = (
-            _node_warnings(prepared.installed_nodes, nodes)
+            _node_warnings(prepared.installed_nodes, nodes, prepared.removed_nodes)
             if attach_nodes and prepared.installed_nodes
             else []
         )
@@ -504,22 +506,35 @@ def _stage_local_node_packs(packs: dict[str, Path], node_dir: Path) -> dict[str,
         return {}
 
 
-def _node_warnings(installed: _InstalledNodes, staged_nodes: dict[str, Path]) -> list[str]:
-    """A warning for custom nodes whose files couldn't be attached."""
-    missing = sorted(
-        class_type
-        for class_type in installed.custom
-        if class_type not in installed.dirs or installed.dirs[class_type].name not in staged_nodes
-    )
-    if not missing:
-        return []
-    return [
-        (
+def _node_warnings(
+    installed: _InstalledNodes, staged_nodes: dict[str, Path], removed: set[str] | None = None
+) -> list[str]:
+    """
+    A warning for custom nodes whose files couldn't be attached, and one for the nodes of the packs
+    the artist removed.
+    """
+    removed = removed or set()
+    missing: list[str] = []
+    left_out: list[str] = []
+    for class_type in sorted(installed.custom):
+        pack = installed.dirs.get(class_type)
+        if pack is not None and pack.name in staged_nodes:
+            continue
+        (left_out if pack is not None and pack.name in removed else missing).append(class_type)
+    warnings = []
+    if missing:
+        warnings.append(
             f"The files of the custom nodes {', '.join(missing)} couldn't be attached. The job "
             "fails unless the workers already have them, for example in a custom nodes conda "
             "package."
         )
-    ]
+    if left_out:
+        warnings.append(
+            f"The custom nodes {', '.join(left_out)} aren't attached, since you removed their "
+            "pack. The job fails unless the workers already have them, such as in a custom nodes "
+            "conda package."
+        )
+    return warnings
 
 
 def _model_warnings(workflow: dict[str, Any], attached: dict[str, Path]) -> list[str]:
@@ -559,6 +574,24 @@ def _exclude_local_models(
     prepared.warnings = [w for w in prepared.warnings if w not in prepared.model_warnings]
     prepared.model_warnings = _model_warnings(workflow, prepared.local_models)
     prepared.warnings.extend(prepared.model_warnings)
+
+
+def _exclude_local_nodes(prepared: _Prepared, excluded: set[str]) -> None:
+    """Leaves out the custom node packs the artist removed, by name, and warns about them."""
+    removed = excluded & set(prepared.local_nodes)
+    if not removed:
+        return
+    prepared.removed_nodes = removed
+    prepared.local_nodes = {
+        name: path for name, path in prepared.local_nodes.items() if name not in removed
+    }
+    prepared.warnings = [w for w in prepared.warnings if w not in prepared.node_warnings]
+    prepared.node_warnings = (
+        _node_warnings(prepared.installed_nodes, prepared.local_nodes, removed)
+        if prepared.installed_nodes
+        else []
+    )
+    prepared.warnings.extend(prepared.node_warnings)
 
 
 def _local_model_paths(
@@ -811,6 +844,15 @@ def _model_ids(value: Any) -> set[str]:
     return set(value)
 
 
+def _pack_names(value: Any) -> set[str]:
+    """The custom node packs the artist chose not to attach. Raises SubmitError."""
+    if value is None:
+        return set()
+    if not isinstance(value, list) or not all(isinstance(name, str) for name in value):
+        raise SubmitError("excludedNodes must be a list of custom node pack names.")
+    return set(value)
+
+
 def _string_map(value: Any, what: str) -> dict[str, Any]:
     """Checks a {name: value} object of parameter values or job settings. Raises SubmitError."""
     if value is None:
@@ -874,6 +916,7 @@ async def _build_bundle(
     parameters = _string_map(body.get("parameters"), "parameters")
     assets = _attachments(body.get("attachments"))
     excluded_models = _model_ids(body.get("excludedModels"))
+    excluded_nodes = _pack_names(body.get("excludedNodes"))
     requirements = host_requirements(body.get("hostRequirements"))
     description = job_description(body.get("description"))
     definitions = read_job_template(template).get("parameterDefinitions") or []
@@ -898,6 +941,7 @@ async def _build_bundle(
         except OSError:
             logger.warning("Couldn't mark %s to delete after submitting", _log_value(bundle_dir))
     _exclude_local_models(prepared, excluded_models, workflow)
+    _exclude_local_nodes(prepared, excluded_nodes)
     # The job ignores attached packs with Attach Custom Nodes off, so they aren't uploaded.
     attach_nodes = _attaches_nodes(definitions, parameters)
     # Copying models and custom nodes can take a while when the bundle is on another volume.

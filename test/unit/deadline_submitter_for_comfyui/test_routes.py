@@ -2147,6 +2147,81 @@ def test_jobs_warns_when_a_planned_custom_node_pack_cant_be_staged(comfy, monkey
     assert "CustomNodesDirectory" not in bridge_requests(requests)[0]["request"]["parameters"]
 
 
+# Names that can hold credentials. Anyone who can use the queue can read job attachments.
+PACK_CREDENTIALS = (
+    ".env",
+    "prod.env",
+    ".envrc",
+    ".git-credentials",
+    ".npmrc",
+    ".pypirc",
+    ".netrc",
+    ".htpasswd",
+    ".boto",
+    ".s3cfg",
+    "kubeconfig",
+    "token",
+    "hf_token",
+    "api_key.txt",
+    "id_rsa",
+    "id_dsa",
+    "putty.ppk",
+    "release.jks",
+    "client.pem",
+    "service_account.json",
+    "client_secret_1234.json",
+    "credentials.json",
+    "secrets.yaml",
+)
+
+
+def test_a_saved_bundle_holds_none_of_a_packs_credential_files(comfy, monkeypatch):
+    pack, workflow = _studio_pack(comfy, monkeypatch)
+    for name in PACK_CREDENTIALS:
+        (pack / name).write_text("secret")
+        (pack / "nodes" / name).write_text("secret")
+    (pack / "config.json").write_text("{}")
+    (pack / "tokenizer.json").write_text("{}")
+    fake_bridge(monkeypatch, comfy.tmp_path, {})
+    status, response = run(
+        call(comfy, "/deadline/bundle", {**JOB, "workflow": workflow, "parameters": {}})
+    )
+    assert status == 200
+    staged = Path(response["job_bundle"]) / "local_nodes" / "studio-nodes"
+    files = sorted(path.relative_to(staged).as_posix() for path in staged.rglob("*"))
+    assert files == ["__init__.py", "config.json", "nodes", "nodes/resize.py", "tokenizer.json"]
+
+
+@pytest.mark.parametrize("route", ["/deadline/jobs", "/deadline/bundle"])
+def test_a_removed_custom_node_pack_isnt_attached(comfy, monkeypatch, route):
+    """The artist can leave a pack out, such as one with keys in its settings."""
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    _, workflow = _studio_pack(comfy, monkeypatch)
+    requests = fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [result({"jobId": "job-1"})]})
+    body = {**JOB, "workflow": workflow, "parameters": {}, "excludedNodes": ["studio-nodes"]}
+    status, response = run(call(comfy, route, body))
+    assert status in (200, 202)
+    bundle = Path(response["job_bundle"])
+    assert not (bundle / "local_nodes").exists()
+    [warning] = [w for w in response["warnings"] if "StudioResize" in w]
+    assert "aren't attached, since you removed their pack" in warning
+    if route == "/deadline/jobs":
+        sent = bridge_requests(requests)[0]["request"]["parameters"]
+    else:
+        saved = yaml.safe_load((bundle / "parameter_values.yaml").read_text())["parameterValues"]
+        sent = {item["name"]: item["value"] for item in saved}
+    assert "CustomNodesDirectory" not in sent
+
+
+def test_excluded_nodes_must_be_a_list_of_names(comfy, monkeypatch):
+    _, workflow = _studio_pack(comfy, monkeypatch)
+    fake_bridge(monkeypatch, comfy.tmp_path, {})
+    body = {**JOB, "workflow": workflow, "excludedNodes": "studio-nodes"}
+    status, response = run(call(comfy, "/deadline/bundle", body))
+    assert status == 400
+    assert response["error"] == "excludedNodes must be a list of custom node pack names."
+
+
 def _staged_node_packs(response: dict) -> list[str]:
     bundle = Path(response["job_bundle"])
     references = yaml.safe_load((bundle / "asset_references.yaml").read_text())

@@ -169,6 +169,16 @@ def test_attachment_lists_keep_independent_scroll_positions_when_updated(run_sce
     assert result["attachmentsStillOpen"] is True
 
 
+def test_a_custom_node_pack_can_be_removed_and_added_back(run_scenario):
+    """A pack can hold keys in its settings, which anyone who can use the queue could read."""
+    result = run_scenario("all-attachments")
+    assert result["packRowRemoved"] == "dl-removed"
+    assert "Not attaching the custom nodes in studio-nodes." in result["packStatus"]
+    assert result["excludedNodes"] == ["studio-nodes"]
+    assert "Not attaching the custom nodes" not in result["packStatusAfterRestoring"]
+    assert result["excludedNodesAfterRestoring"] == []
+
+
 def test_a_model_is_removed_by_its_folder_and_name(run_scenario):
     """Two models with the same file name, in different folders, are removed one at a time."""
     result = run_scenario("same-name-models")

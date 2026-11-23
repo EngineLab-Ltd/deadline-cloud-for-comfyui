@@ -18,8 +18,8 @@ GPU workers, with the models, input files and custom nodes it uses attached to t
     workers, how workers read attachments, and whether every input path has to exist
   - [host requirements](#host-requirements), starting from the job template's
   - the job template's parameters, such as Workflow Timeout, and the queue's, such as Conda Channels
-  - the input files and folders, models and custom nodes to attach. You can remove files, folders
-    and models, or add more with a file dialog on the ComfyUI machine
+  - the input files and folders, models and custom nodes to attach. You can remove files, folders,
+    models and custom node packs, or add more with a file dialog on the ComfyUI machine
   - upload progress, the status of your recent jobs, and **Download** for their outputs, which
     go back into the output directory they were submitted with. Each job shows that directory.
   - **Save job bundle**, which creates the job bundle without submitting it, to submit later with
@@ -182,6 +182,12 @@ attachments, uploaded from this machine:
   layered on the conda environment, which they can't change. When a pack's files can't be found
   on this machine, the panel warns about it. The job fails with the import error when a custom
   node doesn't load.
+
+  Anyone who can use the queue can read a job's attachments. Staging leaves out files named like
+  credential stores, such as `.env`, `*.pem`, `.npmrc`, `hf_token` and `service_account.json`,
+  and links that point outside the pack. A pack can still keep a key somewhere else, such as in
+  its `config.json`. Check the packs listed under **Attachments**, and remove one with its **✕**
+  to leave it out of the job. The job then fails unless the workers already have that pack.
 
   Turn off **Attach Custom Nodes** when the workers already provide every custom node and its
   dependencies, such as through a custom nodes conda package added to **Conda Packages**, or a

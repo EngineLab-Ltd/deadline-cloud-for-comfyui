@@ -1,7 +1,5 @@
 [envs.default]
-pre-install-commands = [
-  "pip install -r requirements-testing.txt"
-]
+pre-install-commands = ["pip install -r requirements-testing.txt"]
 
 [envs.default.scripts]
 sync = "pip install -r requirements-testing.txt"
@@ -19,6 +17,17 @@ lint = [
   "style",
   "typing",
 ]
+
+[envs.integ]
+pre-install-commands = [
+  "pip install -r requirements-testing.txt",
+  "pip install -r requirements-integ-testing.txt",
+  "python -m playwright install chromium"
+]
+
+[envs.integ.scripts]
+sync = "pip install -r requirements-integ-testing.txt"
+test = "pytest --no-cov {args:test/integ} -vvv"
 
 [[envs.all.matrix]]
 python = ["3.13", "3.14"]

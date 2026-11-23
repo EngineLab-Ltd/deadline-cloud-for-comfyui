@@ -292,7 +292,7 @@ def _is_secret_node_file(name: str) -> bool:
     return any(fnmatch.fnmatch(name, pattern) for pattern in _SECRET_NODE_FILES)
 
 
-def _ignore_node_files(root: Path, directory: str, names: list[str]) -> set[str]:
+def _ignore_node_files(root: Path, directory: str, names: list[str], log: bool = True) -> set[str]:
     """
     The entries of a pack's folder to leave out of the job. root is the pack's folder, resolved.
     copytree follows links, so an entry is attached only when it resolves inside the pack, and is
@@ -301,6 +301,7 @@ def _ignore_node_files(root: Path, directory: str, names: list[str]) -> set[str]
     resolved, not only symbolic links, since Python doesn't count a Windows directory junction as
     one.
     """
+    warn = logger.warning if log else _quiet
     ignored = set()
     real_directory = os.path.realpath(directory)
     for name in names:
@@ -311,26 +312,30 @@ def _ignore_node_files(root: Path, directory: str, names: list[str]) -> set[str]
         target = path.resolve()
         is_link = str(target) != os.path.join(real_directory, name)
         if not target.is_relative_to(root):
-            logger.warning("Leaving %s out of the job: it links outside the pack", path)
+            warn("Leaving %s out of the job: it links outside the pack", path)
             ignored.add(name)
         elif not (path.is_file() or path.is_dir()):
             # Such as a named pipe, which would block the copy, or a link to nothing.
-            logger.warning("Leaving %s out of the job: it isn't a file or a folder", path)
+            warn("Leaving %s out of the job: it isn't a file or a folder", path)
             ignored.add(name)
         elif is_link and path.is_dir():
-            logger.warning(
+            warn(
                 "Leaving %s out of the job: it links to a folder in the pack, which is attached "
                 "under its own name",
                 path,
             )
             ignored.add(name)
         elif is_link and _in_skipped_node_entry(root, target):
-            logger.warning("Leaving %s out of the job: it links to a file that's left out", path)
+            warn("Leaving %s out of the job: it links to a file that's left out", path)
             ignored.add(name)
         elif path.is_file() and (_is_secret_node_file(name) or _is_secret_node_file(target.name)):
-            logger.warning("Leaving %s out of the job: it can hold credentials", path)
+            warn("Leaving %s out of the job: it can hold credentials", path)
             ignored.add(name)
     return ignored
+
+
+def _quiet(*_args: Any) -> None:
+    pass
 
 
 def _skipped_node_entry(name: str, path: Path) -> bool:
@@ -362,6 +367,49 @@ def _link_or_copy(source: str, target: str, copied: list[str] | None = None) -> 
         if copied is not None:
             copied.append(source)
     return target
+
+
+# Counting a pack's files stops here. Planning stays quick for a pack with a folder of models.
+MAX_COUNTED_NODE_FILES = 100_000
+
+
+@dataclass
+class NodePackSize:
+    """What a custom node pack adds to a job, leaving out what staging leaves out."""
+
+    bytes: int = 0
+    files: int = 0
+    # False when the pack has more than MAX_COUNTED_NODE_FILES files, and counting stopped.
+    complete: bool = True
+
+
+def node_pack_size(source: Path) -> NodePackSize:
+    """The size and file count of a custom node pack, as staging would attach it."""
+    size = NodePackSize()
+    if not source.is_dir():
+        size.bytes, size.files = _file_size(source), 1
+        return size
+    root = source.resolve()
+    # Following links is bounded: the ignore rules leave out every link to a folder in the pack.
+    for directory, folders, files in os.walk(source, followlinks=True):
+        ignored = _ignore_node_files(root, directory, folders + files, log=False)
+        folders[:] = [folder for folder in folders if folder not in ignored]
+        for name in files:
+            if name in ignored:
+                continue
+            if size.files == MAX_COUNTED_NODE_FILES:
+                size.complete = False
+                return size
+            size.bytes += _file_size(Path(directory, name))
+            size.files += 1
+    return size
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 def stage_local_node_packs(packs: Mapping[str, Path], dest: Path) -> dict[str, Path]:

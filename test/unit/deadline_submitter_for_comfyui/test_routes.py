@@ -2035,7 +2035,10 @@ def test_plan_lists_local_custom_nodes_and_doesnt_warn_about_them(comfy, monkeyp
     pack, workflow = _studio_pack(comfy, monkeypatch)
     status, body = run(call(comfy, "/deadline/plan", {"workflow": workflow, "name": "fox"}))
     assert status == 200
-    assert body["localNodes"] == [{"name": "studio-nodes", "path": str(pack)}]
+    # The pack's two empty .py files. .git isn't attached, so it isn't counted.
+    assert body["localNodes"] == [
+        {"name": "studio-nodes", "path": str(pack), "size": 0, "files": 2, "counted": True}
+    ]
     assert body["nodeWarnings"] == []
     assert not any("custom nodes" in warning for warning in body["warnings"])
     # Planning doesn't stage anything.

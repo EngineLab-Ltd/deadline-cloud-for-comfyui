@@ -172,6 +172,12 @@ def test_attachment_lists_keep_independent_scroll_positions_when_updated(run_sce
 def test_a_custom_node_pack_can_be_removed_and_added_back(run_scenario):
     """A pack can hold keys in its settings, which anyone who can use the queue could read."""
     result = run_scenario("all-attachments")
+    assert result["packRow"].startswith("studio-nodes (3.2 GB in 12,500 files)")
+    # A job uploads a large pack until the artist removes it.
+    assert (
+        "The custom node pack studio-nodes is 3.2 GB in 12,500 files." in result["largePackStatus"]
+    )
+    assert "The custom node pack" not in result["packStatus"]
     assert result["packRowRemoved"] == "dl-removed"
     assert "Not attaching the custom nodes in studio-nodes." in result["packStatus"]
     assert result["excludedNodes"] == ["studio-nodes"]

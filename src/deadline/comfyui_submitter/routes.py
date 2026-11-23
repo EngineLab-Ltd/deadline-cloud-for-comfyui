@@ -34,6 +34,7 @@ from .get_local_assets import (
     find_workflow_local_models,
     get_local_assets,
     model_name,
+    node_pack_size,
     stage_local_models,
     stage_local_node_packs,
     write_asset_references,
@@ -721,11 +722,21 @@ def _plan(body: dict[str, Any], workflow: dict[str, Any], template: Path) -> dic
         ],
         "hostRequirements": template_host_requirements(job_template),
         # Attached when submitting, unless the artist turns off Attach Custom Nodes.
-        "localNodes": [
-            {"name": name, "path": str(path)} for name, path in prepared.local_nodes.items()
-        ],
+        "localNodes": [_local_node(name, path) for name, path in prepared.local_nodes.items()],
         "warnings": prepared.warnings,
         "nodeWarnings": prepared.node_warnings,
+    }
+
+
+def _local_node(name: str, path: Path) -> dict[str, Any]:
+    """A custom node pack for the panel to list, with its size and file count."""
+    size = node_pack_size(path)
+    return {
+        "name": name,
+        "path": str(path),
+        "size": size.bytes,
+        "files": size.files,
+        "counted": size.complete,
     }
 
 

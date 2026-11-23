@@ -72,6 +72,16 @@ interface HostRequirements {
 }
 
 // What /deadline/plan returns for the workflow.
+// A custom node pack the job attaches, and its size and file count. counted is false when the
+// pack had more files than the server counts.
+interface LocalNode {
+  name: string;
+  path: string;
+  size?: number;
+  files?: number;
+  counted?: boolean;
+}
+
 interface Plan {
   name: string;
   template: string;
@@ -83,7 +93,7 @@ interface Plan {
   // id is the model's folder and name, such as checkpoints/sd.safetensors. Two models can share a
   // name in different folders.
   localModels?: { id: string; name: string; directory: string | null; path: string }[];
-  localNodes?: { name: string; path: string }[];
+  localNodes?: LocalNode[];
   warnings?: string[];
   nodeWarnings?: string[];
 }
@@ -1201,6 +1211,20 @@ function renderStatus() {
         )
       );
     }
+    const largePacks = attachesNodes()
+      ? (plan.localNodes ?? []).filter(
+          (pack) => isLargePack(pack) && !state.removedAttachments.has(pack.path)
+        )
+      : [];
+    for (const pack of largePacks) {
+      children.push(
+        h(
+          "div",
+          { className: "dl-notice dl-warn-box" },
+          `The custom node pack ${pack.name} is ${packSize(pack)}. A job that uses one of its nodes uploads the whole pack. Remove it under Attachments if the workers already have it.`
+        )
+      );
+    }
     const removedPacks = attachesNodes() ? excludedNodes() : [];
     if (removedPacks.length) {
       children.push(
@@ -1812,6 +1836,40 @@ function excludedModels(): string[] {
     .map((model) => model.id);
 }
 
+// The panel warns about a pack above either of these. A job that uses the pack uploads it.
+const LARGE_PACK_BYTES = 1_000_000_000;
+const LARGE_PACK_FILES = 10_000;
+
+// A size in bytes, such as 1.5 GB. Storage and transfer sizes count in thousands.
+export function formatSize(bytes: number): string {
+  const units = ["bytes", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1000 && unit < units.length - 1) {
+    value /= 1000;
+    unit += 1;
+  }
+  return unit === 0 ? `${bytes} bytes` : `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`;
+}
+
+function packSize(pack: LocalNode): string | null {
+  if (pack.size === undefined || pack.files === undefined) {
+    return null;
+  }
+  const files = `${pack.files.toLocaleString("en-US")} files`;
+  return pack.counted === false
+    ? `at least ${formatSize(pack.size)} in over ${files}`
+    : `${formatSize(pack.size)} in ${files}`;
+}
+
+function isLargePack(pack: LocalNode): boolean {
+  return (
+    pack.counted === false ||
+    (pack.size ?? 0) > LARGE_PACK_BYTES ||
+    (pack.files ?? 0) > LARGE_PACK_FILES
+  );
+}
+
 // The custom node packs the artist removed. With Attach Custom Nodes off, none are attached.
 function excludedNodes(): string[] {
   return (state.plan?.localNodes ?? [])
@@ -1945,7 +2003,7 @@ function renderAttachments() {
             { className: "dl-files" },
             localNodes.map((pack) =>
               attachmentItem(
-                pack.name,
+                packSize(pack) ? `${pack.name} (${packSize(pack)})` : pack.name,
                 pack.path,
                 null,
                 toggleFound(pack, true),

@@ -188,6 +188,9 @@ attachments, uploaded from this machine:
   and links that point outside the pack. A pack can still keep a key somewhere else, such as in
   its `config.json`. Check the packs listed under **Attachments**, and remove one with its **✕**
   to leave it out of the job. The job then fails unless the workers already have that pack.
+  Each pack is listed with its size and file count. A job that uses one of its nodes uploads the
+  whole pack. The panel warns about a pack over 1 GB or 10,000 files, such as one that downloads
+  models into its own folder.
 
   Turn off **Attach Custom Nodes** when the workers already provide every custom node and its
   dependencies, such as through a custom nodes conda package added to **Conda Packages**, or a

@@ -9,10 +9,12 @@ import yaml
 
 from deadline.comfyui_submitter.get_local_assets import (
     LocalAssets,
+    NodePackSize,
     _search_local_models,
     find_local_model,
     find_workflow_local_models,
     get_local_assets,
+    node_pack_size,
     stage_local_models,
     stage_local_node_packs,
     write_asset_references,
@@ -684,6 +686,27 @@ def test_stage_local_node_packs_refuses_names_that_differ_only_in_case(comfy, tm
     }
     assert _staged_files(dest, "MyPack") == ["first.py"]
     assert "its name and 'MyPack' differ in case alone" in caplog.text
+
+
+def test_node_pack_size_counts_what_staging_attaches(comfy, tmp_path):
+    pack = comfy["custom_nodes"] / "studio-nodes"
+    (pack / "nodes").mkdir(parents=True)
+    (pack / "__init__.py").write_bytes(b"x" * 10)
+    (pack / "nodes" / "big.bin").write_bytes(b"x" * 1000)
+    touch(pack / ".git" / "objects" / "pack.idx")
+    touch(pack / ".env")
+    _symlink(pack / "nodes" / "loop", pack)
+    assert node_pack_size(pack) == NodePackSize(bytes=1010, files=2, complete=True)
+    assert node_pack_size(touch(tmp_path / "single.py")) == NodePackSize(1, 1, True)
+
+
+def test_node_pack_size_stops_counting_a_huge_pack(comfy, monkeypatch):
+    """A pack that downloads models into its own folder can store thousands of files."""
+    monkeypatch.setattr("deadline.comfyui_submitter.get_local_assets.MAX_COUNTED_NODE_FILES", 3)
+    pack = comfy["custom_nodes"] / "studio-nodes"
+    for index in range(5):
+        touch(pack / "ckpts" / f"{index}.bin")
+    assert node_pack_size(pack) == NodePackSize(bytes=3, files=3, complete=False)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Named pipes are POSIX only.")

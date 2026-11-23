@@ -239,10 +239,12 @@ if (scenario === "edited-before-replanning") {
   const text = (node) =>
     node.children.map((child) => (child instanceof NodeStub ? text(child) : String(child))).join("");
   const pack = "/custom_nodes/studio-nodes";
-  const localNodes = [{ name: "studio-nodes", path: pack }];
+  const localNodes = [{ name: "studio-nodes", path: pack, size: 3_200_000_000, files: 12_500, counted: true }];
   api.handlers["/deadline/plan"] = async (body) => ({ ...planFor(body), localNodes });
   await ui.loadPlan(true);
   view.render(["attachments"]);
+  result.packRow = text(rows().find((row) => row.attributes.title === pack));
+  result.largePackStatus = text(ui.__renderers.status());
   click(pack);
   result.packRowRemoved = rows().find((row) => row.attributes.title === pack).className;
   result.packStatus = text(ui.__renderers.status());

@@ -285,8 +285,13 @@ def validate_api_workflow(workflow: Any, ui_workflow: Any = None) -> dict[str, A
             raise SubmitError(f"Node {_quoted(node_id)} has a _meta that isn't an object.")
         if node["class_type"] == "CreateList":
             for key in node.get("inputs", {}):
-                match = _ANY_LIST_ITEM_INPUT.fullmatch(str(key))
-                if match and not _LIST_ITEM_INPUT.fullmatch(str(key)):
+                ascii_digits = _ANY_LIST_ITEM_INPUT.fullmatch(str(key))
+                if _UNICODE_LIST_ITEM_INPUT.fullmatch(str(key)) and not ascii_digits:
+                    raise SubmitError(
+                        f"Create List {_quoted(node_id)} has an input named {_quoted(key)}, "
+                        "numbered with digits that ComfyUI doesn't use."
+                    )
+                if ascii_digits and not _LIST_ITEM_INPUT.fullmatch(str(key)):
                     raise SubmitError(
                         f"Create List {_quoted(node_id)} has an input numbered past "
                         f"{_MAX_LIST_ITEM_DIGITS} digits, which ComfyUI doesn't make."
@@ -327,6 +332,10 @@ TASKS_GROUP = "Tasks"
 _MAX_LIST_ITEM_DIGITS = 9
 _LIST_ITEM_INPUT = re.compile(rf"(inputs\.)?input\d{{1,{_MAX_LIST_ITEM_DIGITS}}}", re.ASCII)
 _ANY_LIST_ITEM_INPUT = re.compile(r"(inputs\.)?input\d+", re.ASCII)
+# Digits in any script, such as Arabic-Indic ones, which Python's \d matches without re.ASCII.
+_UNICODE_LIST_ITEM_INPUT = re.compile(r"(inputs\.)?input\d+")
+# The _meta keys the submitter writes for the task script. A workflow's own are dropped.
+_SUBMITTER_META_PREFIX = "deadline_"
 # The titles ComfyUI gives the nodes that list tasks. Any other title is one the artist gave.
 _DEFAULT_TITLES = {
     "CreateList": "Create List",
@@ -568,6 +577,10 @@ def plan_task_lists(
         meta = node.get("_meta")
         if not isinstance(meta, dict):
             meta = node["_meta"] = {}
+        # The task script follows these keys, so a shared workflow's own could make a node follow
+        # another list's items, or load files the panel never showed.
+        for key in [key for key in meta if str(key).startswith(_SUBMITTER_META_PREFIX)]:
+            del meta[key]
         source: ItemSource | None = None
         if class_type == "CreateList":
             values = _list_items(inputs, workflow)

@@ -964,6 +964,15 @@ def test_create_list_keeps_the_tasks_item(tmp_path):
     assert "Running the workflow with List1 3" in output
 
 
+def test_create_list_counts_inputs_numbered_with_ascii_digits_alone(tmp_path):
+    """The panel counts them that way, so an input numbered with other digits isn't an item."""
+    workflow = _create_list()
+    workflow["1"]["inputs"]["inputs.input\u0660"] = ["hidden", 0]
+    code, output, ran = run_task(tmp_path, workflow, {"List1": 3})
+    assert code == 0, output
+    assert ran["1"]["inputs"] == {"inputs.input0": ["4", 0], "inputs.input\u0660": ["hidden", 0]}
+
+
 def test_lists_without_a_task_parameter_run_whole(tmp_path):
     # The submitter leaves out the task parameters of sources that are turned off.
     code, output, ran = run_task(tmp_path, _create_list(), {})

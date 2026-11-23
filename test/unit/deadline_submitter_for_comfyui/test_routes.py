@@ -613,6 +613,14 @@ def _list_into(meta: object) -> dict:
             },
             "Create List 1 has an input numbered past 9 digits, which ComfyUI doesn't make.",
         ),
+        (
+            # An Arabic-Indic zero. The worker would have counted it as an item the panel didn't.
+            {"1": {"class_type": "CreateList", "inputs": {"input0": "a", "input\u0660": "b"}}},
+            (
+                "Create List 1 has an input named input\u0660, numbered with digits that ComfyUI "
+                "doesn't use."
+            ),
+        ),
     ],
 )
 @pytest.mark.parametrize("split", [True, False])

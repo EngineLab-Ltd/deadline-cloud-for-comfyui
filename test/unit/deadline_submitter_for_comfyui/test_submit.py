@@ -853,6 +853,30 @@ def test_plan_task_lists_for_folder_loaders(tmp_path):
     assert plan_task_lists(workflow).sources == []
 
 
+def test_plan_task_lists_drops_the_workflows_own_submitter_keys(tmp_path):
+    """A shared workflow can't preset the keys the task script follows on a node."""
+    input_dir = _input_dir(tmp_path)
+    preset = {submit.ITEM_META: "List1", submit.FILES_META: ["../../secret.png"] * 2}
+    workflow = {
+        "1": _create_list("3", "4"),
+        # A folder of one image isn't split. The submitter writes nothing on it.
+        "5": {
+            "class_type": "LoadImageDataSetFromFolder",
+            "inputs": {"folder": "one"},
+            "_meta": {**preset, "title": "Plates"},
+        },
+        "6": {"class_type": "SaveImage", "inputs": {}, "_meta": dict(preset)},
+    }
+    (input_dir / "one").mkdir()
+    (input_dir / "one" / "a.png").write_bytes(b"x")
+    plan = plan_task_lists(workflow, input_dir)
+    assert [source.name for source in plan.active] == ["List1"]
+    assert plan.workflow["5"]["_meta"] == {"title": "Plates"}
+    assert "_meta" not in plan.workflow["6"]
+    # The workflow passed in is unchanged.
+    assert workflow["6"]["_meta"] == preset
+
+
 def _titles(workflow):
     return [source.title for source in plan_task_lists(workflow).sources]
 

@@ -316,8 +316,8 @@ ITEM_META = "deadline_item"
 FILES_META = "deadline_files"
 # OpenJD allows 16 task parameters in a step.
 MAX_ITEM_SOURCES = 16
-# The line of the task script that create_job_bundle fills in with each task's items. A job
-# template without it runs whole lists.
+# The line that marks the task script that selects each task's items, which it reads from its
+# NAME=NUMBER arguments. A job template without it runs whole lists.
 ITEMS_PLACEHOLDER = "ITEMS = {}"
 # The group of the job parameters that hold each list's items to run.
 TASKS_GROUP = "Tasks"
@@ -699,7 +699,9 @@ def template_has_own_task_parameters(template: Path) -> bool:
 def add_task_lists(template: dict[str, Any], sources: list[ItemSource]) -> dict[str, Any]:
     """
     Returns a copy of a job template with a job parameter and a task parameter for each list, in
-    the step whose task script has the ITEMS placeholder.
+    the step whose task script has the ITEMS placeholder. The task script gets each task's items
+    as NAME=NUMBER arguments, so no value is written into its code. A studio template's other
+    steps are left as they are.
     """
     template = copy.deepcopy(template)
     definitions = template.setdefault("parameterDefinitions", [])
@@ -709,21 +711,18 @@ def add_task_lists(template: dict[str, Any], sources: list[ItemSource]) -> dict[
         if (definition.get("userInterface") or {}).get("groupLabel") == "Workflow Parameters":
             at = index + 1
     definitions[at:at] = [_item_parameters(source) for source in sources]
-    items = ", ".join(f'"{source.name}": {{{{Task.Param.{source.name}}}}}' for source in sources)
-    for step in template.get("steps", []):
-        files = step.get("script", {}).get("embeddedFiles", [])
-        if not any(_ITEMS_PLACEHOLDER_LINE.search(file.get("data", "")) for file in files):
-            continue
-        for file in files:
-            file["data"] = _ITEMS_PLACEHOLDER_LINE.sub(
-                lambda match: match.group().replace(ITEMS_PLACEHOLDER, f"ITEMS = {{{items}}}"),
-                file.get("data", ""),
-            )
-        space = step.setdefault("parameterSpace", {})
-        space.setdefault("taskParameterDefinitions", []).extend(
-            {"name": source.name, "type": "INT", "range": f"{{{{Param.{source.parameter}}}}}"}
-            for source in sources
-        )
+    step = _task_lists_step(template)
+    if step is None:
+        return template
+    on_run = step.setdefault("script", {}).setdefault("actions", {}).setdefault("onRun", {})
+    on_run.setdefault("args", []).extend(
+        f"{source.name}={{{{Task.Param.{source.name}}}}}" for source in sources
+    )
+    space = step.setdefault("parameterSpace", {})
+    space.setdefault("taskParameterDefinitions", []).extend(
+        {"name": source.name, "type": "INT", "range": f"{{{{Param.{source.parameter}}}}}"}
+        for source in sources
+    )
     return template
 
 

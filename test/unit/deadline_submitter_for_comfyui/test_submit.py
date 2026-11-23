@@ -1,4 +1,5 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+import copy
 import json
 import os
 import re
@@ -752,10 +753,45 @@ def test_add_task_lists():
         {"name": "List1", "type": "INT", "range": "{{Param.List1Items}}"},
         {"name": "Folder6", "type": "INT", "range": "{{Param.Folder6Items}}"},
     ]
-    script = step["script"]["embeddedFiles"][0]["data"]
-    assert 'ITEMS = {"List1": {{Task.Param.List1}}, "Folder6": {{Task.Param.Folder6}}}\n' in script
+    # The task script gets the task's items as arguments, and its code is unchanged.
+    assert step["script"]["actions"]["onRun"]["args"] == [
+        "{{Task.File.Run}}",
+        "List1={{Task.Param.List1}}",
+        "Folder6={{Task.Param.Folder6}}",
+    ]
+    assert step["script"]["embeddedFiles"] == base["steps"][0]["script"]["embeddedFiles"]
     # The template passed in is unchanged.
     assert base == yaml.safe_load(submit.JOB_TEMPLATE.read_text())
+
+
+def test_add_task_lists_leaves_a_studio_templates_other_steps_alone():
+    """A studio step with its own task parameters, and the ITEMS line, keeps its parameter space."""
+    base = yaml.safe_load(submit.JOB_TEMPLATE.read_text())
+    frames = copy.deepcopy(base["steps"][0])
+    frames["name"] = "StudioFrames"
+    frames["parameterSpace"] = {
+        "taskParameterDefinitions": [{"name": "Frame", "type": "INT", "range": "1-3"}],
+        "combination": "Frame",
+    }
+    base["steps"].append(frames)
+    template = submit.add_task_lists(base, SOURCES)
+    assert template["steps"][1] == frames
+    decode_job_template(template=template, supported_extensions=["EXPR"])
+
+
+def test_bundle_scripts_have_no_parameter_values_written_into_them(tmp_path):
+    """The scripts read job and task parameters from environment variables and arguments."""
+    bundle_dir, _ = create_job_bundle(
+        submit.JOB_TEMPLATE, API_WORKFLOW, "w", tmp_path, sources=SOURCES
+    )
+    template = yaml.safe_load((bundle_dir / "template.yaml").read_text())
+    scripts = [
+        file["data"]
+        for container in [*template["jobEnvironments"], *template["steps"]]
+        for file in container["script"]["embeddedFiles"]
+    ]
+    assert len(scripts) == 4
+    assert not [script for script in scripts if "{{Param." in script or "{{Task.Param." in script]
 
 
 def test_add_task_lists_shortens_long_item_lists():

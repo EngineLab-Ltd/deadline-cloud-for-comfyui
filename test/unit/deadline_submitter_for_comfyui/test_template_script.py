@@ -117,12 +117,15 @@ def run_task(
     comfy.chmod(0o755)
     items = items or {}
     sources = [submit.ItemSource(name, name, 1) for name in items]
-    task = submit.add_task_lists(TEMPLATE, sources)["steps"][0]["script"]["embeddedFiles"][0]
-    # The task parameters are the only values still filled into the script, as OpenJD does.
-    script = task["data"]
-    for name, index in items.items():
-        script = script.replace(f"{{{{Task.Param.{name}}}}}", str(index))
-    (tmp_path / "run.py").write_text(script, encoding="utf-8")
+    step = submit.add_task_lists(TEMPLATE, sources)["steps"][0]
+    (tmp_path / "run.py").write_text(step["script"]["embeddedFiles"][0]["data"], encoding="utf-8")
+    # The task's items, as OpenJD resolves the step's arguments.
+    arguments = [
+        argument.replace(f"{{{{Task.Param.{name}}}}}", str(index))
+        for argument in step["script"]["actions"]["onRun"]["args"][1:]
+        for name, index in items.items()
+        if argument.startswith(f"{name}=")
+    ]
     env = {
         **os.environ,
         "PATH": f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}",
@@ -136,7 +139,7 @@ def run_task(
         ),
     }
     result = subprocess.run(
-        [sys.executable, str(tmp_path / "run.py")],
+        [sys.executable, str(tmp_path / "run.py"), *arguments],
         cwd=tmp_path / "run",
         env=env,
         capture_output=True,
@@ -918,6 +921,31 @@ def _create_list():
         },
         "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "fox"}},
     }
+
+
+@pytest.mark.parametrize(
+    "argument", ["List1=2 or 1", "List1=", "List1=١", "=2", "List 1=2", "List1"]
+)
+def test_the_task_refuses_an_argument_that_isnt_a_list_and_an_item_number(tmp_path, argument):
+    """The task's items come in as arguments, which the script reads as data, never as code."""
+    script = tmp_path / "run.py"
+    script.write_text(TEMPLATE["steps"][0]["script"]["embeddedFiles"][0]["data"], encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, str(script), argument],
+        env={
+            **os.environ,
+            "PYTHONIOENCODING": "utf-8",
+            **environment_values(tmp_path, OutputDir=str(tmp_path)),
+            "COMFYUI_PORT": "1",
+        },
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    assert result.returncode == 1
+    assert result.stdout.startswith("openjd_fail: The task argument ")
+    assert result.stdout.rstrip("\n").endswith("isn't a list name and an item number.")
 
 
 def test_runs_whole_lists_for_item_0(tmp_path):

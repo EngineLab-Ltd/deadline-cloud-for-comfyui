@@ -460,7 +460,7 @@ steps:
 
         PORT = os.environ["COMFYUI_PORT"]
         # The task's item of each list it runs as tasks, by task parameter. The ComfyUI Submitter
-        # fills this in. A source without one runs whole.
+        # passes them as NAME=NUMBER arguments, read below. A source without one runs whole.
         ITEMS = {}
         OUTPUT_DIR = os.environ["COMFYUI_OUTPUT_DIR"]
         WORKFLOW_TIMEOUT = int(os.environ["COMFYUI_WORKFLOW_TIMEOUT"])
@@ -482,6 +482,16 @@ steps:
             if len(message) > limit:
                 diagnostic(message[limit:])
             sys.exit(1)
+
+
+        for argument in sys.argv[1:]:
+            name, _, number = argument.partition("=")
+            if not (
+                re.fullmatch(r"[A-Za-z0-9_]{1,64}", name, re.ASCII)
+                and re.fullmatch(r"-?[0-9]{1,9}", number, re.ASCII)
+            ):
+                fail(f"The task argument {argument!r} isn't a list name and an item number.")
+            ITEMS[name] = int(number)
 
 
         def interrupt():

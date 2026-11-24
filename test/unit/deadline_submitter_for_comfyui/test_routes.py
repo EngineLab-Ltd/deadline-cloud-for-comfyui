@@ -770,6 +770,16 @@ def test_jobs_gives_the_template_the_name_it_submits_with(comfy, monkeypatch):
         assert bridge_requests(requests)[-1]["request"]["settings"]["name"] == expected
 
 
+@pytest.mark.parametrize("name", ["{{RawParam.WorkflowFile}}", "Fox\u202ev2"])
+def test_jobs_rejects_a_job_name_openjd_would_read_or_show_as_other_text(comfy, monkeypatch, name):
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    status, response = run(call(comfy, "/deadline/jobs", {**JOB, "settings": {"name": name}}))
+    assert status == 400
+    assert "job name can't contain" in response["error"]
+    assert not requests.exists()
+    assert not (comfy.tmp_path / "user" / "deadline_submissions").exists()
+
+
 def test_jobs_passes_require_paths_exist_to_the_library(comfy, monkeypatch):
     requests = fake_tools(monkeypatch, comfy.tmp_path)
     body = {**JOB, "settings": {"requirePathsExist": True}}

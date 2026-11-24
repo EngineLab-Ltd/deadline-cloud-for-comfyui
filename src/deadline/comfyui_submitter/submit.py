@@ -450,6 +450,11 @@ _ATTRIBUTE_VALUE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_-]{0,99}")
 MAX_JOB_DESCRIPTION = 2048
 # OpenJD's longest job name.
 MAX_JOB_NAME = 128
+# Characters a job name can't have: control characters and line breaks, which OpenJD refuses at
+# submission or shows as other text, and the marks that change the text's direction.
+_JOB_NAME_HIDDEN_CHARACTERS = re.compile(
+    "[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]"
+)
 # The IDs that `deadline bundle submit` takes, as Deadline Cloud writes them.
 _BUNDLE_SUBMIT_IDS = (
     ("--farm-id", re.compile(r"farm-[0-9a-f]{32}")),
@@ -642,6 +647,13 @@ def job_name(value: Any) -> str | None:
     value = value.strip()
     if len(value) > MAX_JOB_NAME:
         raise SubmitError(f"The job name can't be over {MAX_JOB_NAME} characters.")
+    # OpenJD reads the template's name as a format string, where {{ RawParam.X }} is a value.
+    if "{{" in value or "}}" in value:
+        raise SubmitError("The job name can't contain {{ or }}, which OpenJD reads as a reference.")
+    if _JOB_NAME_HIDDEN_CHARACTERS.search(value):
+        raise SubmitError(
+            "The job name can't contain control characters, line breaks or text direction marks."
+        )
     return value or None
 
 

@@ -356,13 +356,34 @@ def test_create_job_bundle_sets_the_job_name(tmp_path):
 
 @pytest.mark.parametrize(
     ("value", "expected"),
-    [(None, None), ("", None), ("  ", None), (" Fox ", "Fox"), ("x" * 128, "x" * 128)],
+    [
+        (None, None),
+        ("", None),
+        ("  ", None),
+        (" Fox ", "Fox"),
+        ("x" * 128, "x" * 128),
+        ("Fox {v2} – café 🦊", "Fox {v2} – café 🦊"),
+    ],
 )
 def test_job_name(value, expected):
     assert job_name(value) == expected
 
 
-@pytest.mark.parametrize(("value", "message"), [(5, "must be a string"), ("x" * 129, "over 128")])
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        (5, "must be a string"),
+        ("x" * 129, "over 128"),
+        ("{{RawParam.WorkflowFile}}", "{{ or }}"),
+        ("Fox {{ v2", "{{ or }}"),
+        ("Fox }} v2", "{{ or }}"),
+        ("Fox\tv2", "control characters"),
+        ("Fox\x85v2", "control characters"),
+        ("Fox\u2028v2", "line breaks"),
+        ("Fox\u202ev2", "text direction"),
+        ("Fox\u2067v2", "text direction"),
+    ],
+)
 def test_job_name_rejects(value, message):
     with pytest.raises(SubmitError, match=message):
         job_name(value)
